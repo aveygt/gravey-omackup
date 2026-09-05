@@ -1,0 +1,98 @@
+{
+  "schemaVersion": 1,
+  "id": "gravey.omackup",
+  "name": "Omackup",
+  "version": "1.1.0",
+  "author": "gravey",
+  "license": "MIT",
+  "description": "Incremental restic backups of personal files to USB, NAS, and cloud, with a restore browser in the Omarchy bar.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Omackup",
+    "description": "Back up personal files and restore them from USB, NAS, or cloud.",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 60,
+      "pendingScanIntervalSec": 900,
+      "notifyOnUnbackedUp": true,
+      "notifyOnStaleUnbackedUp": false,
+      "staleUnbackedUpHours": 24,
+      "notifyOnMissedBackup": true,
+      "colorfulBackupBar": true,
+      "use24HourTime": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 15,
+        "max": 3600,
+        "step": 15,
+        "defaultValue": 60
+      },
+      {
+        "key": "pendingScanIntervalSec",
+        "type": "integer",
+        "label": "Unbacked-up change scan (seconds)",
+        "min": 120,
+        "max": 86400,
+        "step": 60,
+        "defaultValue": 900
+      },
+      {
+        "key": "notifyOnUnbackedUp",
+        "type": "boolean",
+        "label": "Notify when any file is unbacked up",
+        "description": "Send a desktop notification as soon as a selected file is new or changed.",
+        "defaultValue": true
+      },
+      {
+        "key": "notifyOnStaleUnbackedUp",
+        "type": "boolean",
+        "label": "Notify when unbacked-up files are older than a set time",
+        "description": "Send a desktop notification after unbacked-up changes have sat for a while.",
+        "defaultValue": false
+      },
+      {
+        "key": "staleUnbackedUpHours",
+        "type": "integer",
+        "label": "Unbacked-up age before notify (hours)",
+        "min": 1,
+        "max": 720,
+        "step": 1,
+        "defaultValue": 24
+      },
+      {
+        "key": "notifyOnMissedBackup",
+        "type": "boolean",
+        "label": "Notify when an automatic backup is missed",
+        "description": "Send a desktop notification when a scheduled backup did not run.",
+        "defaultValue": true
+      },
+      {
+        "key": "colorfulBackupBar",
+        "type": "boolean",
+        "label": "RGB loading bar",
+        "description": "Turn it off for a boring loading bar.",
+        "defaultValue": true
+      },
+      {
+        "key": "use24HourTime",
+        "type": "boolean",
+        "label": "24-hour time",
+        "description": "Show last-updated times as 15:04 instead of 3:04 PM.",
+        "defaultValue": true
+      }
+    ]
+  }
+}

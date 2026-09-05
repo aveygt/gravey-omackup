@@ -1,0 +1,3046 @@
+#!/usr/bin/env python3
+"""Omackup — restic wrapper for personal-file backups."""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_EXCLUDES_FILE = PLUGIN_DIR / "excludes.default.txt"
+CONFIG_DIR = Path.home() / ".config" / "omackup"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+STATE_DIR = Path.home() / ".local" / "state" / "omackup"
+DATA_DIR = Path.home() / ".local" / "share" / "omackup"
+SECRETS_DIR = DATA_DIR / "secrets"
+RESTORE_ROOT = Path.home() / "Restored"
+SERVICE_TEMPLATE = PLUGIN_DIR / "systemd" / "omackup@.service"
+USER_SYSTEMD = Path.home() / ".config" / "systemd" / "user"
+LAUNCHER_DESKTOP_ID = "gravey.omackup"
+LAUNCHER_DESKTOP_PATH = Path.home() / ".local" / "share" / "applications" / f"{LAUNCHER_DESKTOP_ID}.desktop"
+LAUNCHER_MENU_PATH = Path.home() / ".config" / "omarchy" / "extensions" / "omarchy-menu.jsonc"
+LAUNCHER_MENU_BEGIN = "// gravey.omackup:begin"
+LAUNCHER_MENU_END = "// gravey.omackup:end"
+LAUNCHER_STAMP = STATE_DIR / "launcher-installed"
+LAUNCHER_SUMMON = "omarchy-shell shell summon gravey.omackup"
+WORK_LOCK_PATH = STATE_DIR / "work.lock"
+WORK_LOCK_META_PATH = STATE_DIR / "work.lock.json"
+BACKUP_PROGRESS_PATH = STATE_DIR / "backup.progress.jsonl"
+BACKUP_ACTIVE_PATH = STATE_DIR / "backup.active.json"
+WORK_ROLE_BACKUP = "backup"
+WORK_ROLE_PENDING = "pending-changes"
+WORK_ROLE_SELECTION_SIZE = "selection-size"
+PREEMPTABLE_ROLES = frozenset({WORK_ROLE_PENDING, WORK_ROLE_SELECTION_SIZE})
+PREEMPT_WAIT_SEC = 10.0
+
+DEFAULT_RETENTION = {
+    "daily": 7,
+    "weekly": 4,
+    "monthly": 12,
+    "yearly": 3,
+}
+
+# restic --limit-upload/--limit-download are KiB/s. 0 means unlimited.
+RATE_LIMIT_MAX_KIBS = 97_656_250
+
+DEFAULT_EXCLUDES = [
+    ".cache",
+    ".thumbnails",
+    ".local/share/Trash",
+    ".local/share/Steam",
+    ".local/share/containers",
+    ".local/share/omackup/secrets",
+    ".npm",
+    ".cargo/registry",
+    ".cargo/git",
+    ".rustup",
+    "**/.venv",
+    "**/venv",
+    "**/node_modules",
+    "**/.git",
+    "**/.mypy_cache",
+    "**/.pytest_cache",
+    "*.iso",
+    "*.qcow2",
+    "*.vdi",
+    "*.vmdk",
+]
+
+
+class AppError(Exception):
+    def __init__(self, message: str, code: int = 1) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def emit(payload: dict[str, Any], code: int = 0) -> int:
+    json.dump(payload, sys.stdout, indent=2, default=str)
+    sys.stdout.write("\n")
+    return code
+
+
+def emit_event(payload: dict[str, Any]) -> None:
+    json.dump(payload, sys.stdout, separators=(",", ":"), default=str)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def fail(message: str, **extra: Any) -> int:
+    payload: dict[str, Any] = {"ok": False, "error": message}
+    payload.update(extra)
+    return emit(payload, 1)
+
+
+def expand_path(value: str) -> Path:
+    return Path(os.path.expanduser(os.path.expandvars(value))).resolve()
+
+
+def read_default_excludes() -> list[str]:
+    if DEFAULT_EXCLUDES_FILE.is_file():
+        lines: list[str] = []
+        for raw in DEFAULT_EXCLUDES_FILE.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#"):
+                lines.append(line)
+        if lines:
+            return lines
+    return list(DEFAULT_EXCLUDES)
+
+
+def default_config() -> dict[str, Any]:
+    return {
+        "sources": ["~"],
+        "excludes": read_default_excludes(),
+        "exclude_paths": [],
+        "destinations": [],
+    }
+
+
+def ensure_dirs() -> None:
+    for path in (CONFIG_DIR, STATE_DIR, DATA_DIR, SECRETS_DIR):
+        path.mkdir(parents=True, exist_ok=True)
+        if path in (DATA_DIR, SECRETS_DIR):
+            path.chmod(0o700)
+
+
+def load_config() -> dict[str, Any]:
+    ensure_dirs()
+    if not CONFIG_PATH.is_file():
+        cfg = default_config()
+        save_config(cfg)
+        return cfg
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise AppError(f"Invalid config at {CONFIG_PATH}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise AppError(f"Invalid config at {CONFIG_PATH}")
+    data.setdefault("sources", ["~"])
+    data.setdefault("excludes", read_default_excludes())
+    data.setdefault("exclude_paths", [])
+    data.setdefault("destinations", [])
+    return data
+
+
+def save_config(cfg: dict[str, Any]) -> None:
+    ensure_dirs()
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(CONFIG_PATH)
+
+
+def normalize_rate_limit_kibs(value: Any) -> int:
+    try:
+        kibs = int(value)
+    except (TypeError, ValueError):
+        return 0
+    if kibs <= 0:
+        return 0
+    return max(1, min(RATE_LIMIT_MAX_KIBS, kibs))
+
+
+def restic_rate_limit_args(dest: dict[str, Any] | None) -> list[str]:
+    if not dest:
+        return []
+    kibs = normalize_rate_limit_kibs(dest.get("rate_limit_kibs") or 0)
+    if kibs <= 0:
+        return []
+    return ["--limit-upload", str(kibs), "--limit-download", str(kibs)]
+
+
+def dest_secret_dir(name: str) -> Path:
+    path = SECRETS_DIR / safe_name(name)
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o700)
+    return path
+
+
+def safe_name(name: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in name.strip())
+    cleaned = cleaned.strip("-_")
+    if not cleaned:
+        raise AppError("Destination name must contain letters or numbers")
+    return cleaned.lower()
+
+
+def find_dest(cfg: dict[str, Any], name: str) -> dict[str, Any]:
+    key = safe_name(name)
+    for dest in cfg["destinations"]:
+        if safe_name(str(dest.get("name", ""))) == key:
+            return dest
+    raise AppError(f"Unknown destination: {name}")
+
+
+def password_path(name: str) -> Path:
+    return dest_secret_dir(name) / "password"
+
+
+def env_path(name: str) -> Path:
+    return dest_secret_dir(name) / "env"
+
+
+def state_path(name: str) -> Path:
+    return STATE_DIR / f"{safe_name(name)}.json"
+
+
+def load_state(name: str) -> dict[str, Any]:
+    path = state_path(name)
+    if not path.is_file():
+        return {
+            "last_success": 0,
+            "last_failure": 0,
+            "last_error": "",
+            "last_duration_sec": 0,
+        }
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {
+            "last_success": 0,
+            "last_failure": 0,
+            "last_error": "",
+            "last_duration_sec": 0,
+        }
+    if not isinstance(data, dict):
+        return {
+            "last_success": 0,
+            "last_failure": 0,
+            "last_error": "",
+            "last_duration_sec": 0,
+        }
+    return data
+
+
+def save_state(name: str, state: dict[str, Any]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = state_path(name)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+class WorkLockBusy(AppError):
+    def __init__(self, message: str = "Omackup is already walking backup sources") -> None:
+        super().__init__(message)
+
+
+class WorkLockHeldByBackup(AppError):
+    def __init__(self, message: str = "A backup is already running") -> None:
+        super().__init__(message)
+
+
+_tracked_children: list[subprocess.Popen[Any]] = []
+_work_signals_installed = False
+_shutting_down = False
+_backup_progress_dest = ""
+_backup_progress_lock = threading.Lock()
+
+
+def track_child(proc: subprocess.Popen[Any]) -> None:
+    _tracked_children.append(proc)
+
+
+def untrack_child(proc: subprocess.Popen[Any]) -> None:
+    try:
+        _tracked_children.remove(proc)
+    except ValueError:
+        pass
+
+
+def terminate_tracked_children(*, force: bool = False) -> None:
+    for proc in list(_tracked_children):
+        if proc.poll() is not None:
+            untrack_child(proc)
+            continue
+        try:
+            if force:
+                proc.kill()
+            else:
+                proc.terminate()
+        except OSError:
+            pass
+
+
+def _wait_tracked_children(timeout: float) -> None:
+    deadline = time.time() + timeout
+    for proc in list(_tracked_children):
+        remaining = max(0.1, deadline - time.time())
+        try:
+            proc.wait(timeout=remaining)
+        except (subprocess.TimeoutExpired, OSError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        untrack_child(proc)
+
+
+def _handle_work_shutdown(signum: int, _frame: Any) -> None:
+    global _shutting_down
+    if _shutting_down:
+        return
+    _shutting_down = True
+    terminate_tracked_children()
+    _wait_tracked_children(5)
+    raise SystemExit(128 + int(signum or 0))
+
+
+def install_work_signal_handlers() -> None:
+    global _work_signals_installed
+    if _work_signals_installed:
+        return
+    signal.signal(signal.SIGTERM, _handle_work_shutdown)
+    signal.signal(signal.SIGINT, _handle_work_shutdown)
+    _work_signals_installed = True
+
+
+def _own_work_pgid() -> int:
+    """Return this process's pgid only when it is the group leader.
+
+    If setpgrp fails we may still share Quickshell's group; never advertise
+    that, or a preempting backup could SIGKILL the panel.
+    """
+    try:
+        os.setpgrp()
+    except OSError:
+        pass
+    pgid = os.getpgrp()
+    if pgid != os.getpid():
+        return 0
+    return pgid
+
+
+def _read_lock_meta() -> dict[str, Any] | None:
+    if not WORK_LOCK_META_PATH.is_file():
+        return None
+    try:
+        data = json.loads(WORK_LOCK_META_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _write_lock_meta(role: str, dest: str) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pid": os.getpid(),
+        "pgid": _own_work_pgid(),
+        "role": role,
+        "dest": dest,
+        "started": int(time.time()),
+    }
+    tmp = WORK_LOCK_META_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(WORK_LOCK_META_PATH)
+
+
+def _clear_lock_meta() -> None:
+    try:
+        WORK_LOCK_META_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _looks_like_omackup(pid: int) -> bool:
+    return "omackup" in _proc_cmdline(pid)
+
+
+def _looks_like_backup(pid: int) -> bool:
+    cmd = _proc_cmdline(pid)
+    return "omackup" in cmd and "backup" in cmd and "pending-changes" not in cmd
+
+
+def _is_preemptable(pid: int, role: str) -> bool:
+    if not _looks_like_omackup(pid):
+        return False
+    if role in PREEMPTABLE_ROLES:
+        return True
+    cmd = _proc_cmdline(pid)
+    return "pending-changes" in cmd or "selection-size" in cmd
+
+
+def _try_flock(fd: int) -> bool:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    except OSError as exc:
+        if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+            return False
+        raise
+
+
+def _preempt_holder(pid: int, pgid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        return
+    deadline = time.time() + PREEMPT_WAIT_SEC
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.2)
+    if pgid > 1 and pgid == pid:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    time.sleep(0.2)
+
+
+def acquire_exclusive_work_lock(role: str, dest: str = "", *, preempt_pending: bool = False) -> int:
+    """Take the source-walk flock. Metadata is a hint; flock is authority."""
+    install_work_signal_handlers()
+    _own_work_pgid()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(WORK_LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o600)
+    if _try_flock(fd):
+        _write_lock_meta(role, dest)
+        return fd
+
+    meta = _read_lock_meta()
+    holder_pid = 0
+    holder_role = ""
+    holder_pgid = 0
+    if meta:
+        try:
+            holder_pid = int(meta.get("pid") or 0)
+        except (TypeError, ValueError):
+            holder_pid = 0
+        try:
+            holder_pgid = int(meta.get("pgid") or 0)
+        except (TypeError, ValueError):
+            holder_pgid = 0
+        holder_role = str(meta.get("role") or "")
+
+    if not preempt_pending:
+        os.close(fd)
+        raise WorkLockBusy()
+
+    holder_is_backup = bool(
+        holder_pid
+        and holder_pid != os.getpid()
+        and _pid_alive(holder_pid)
+        and (_looks_like_backup(holder_pid) or holder_role == WORK_ROLE_BACKUP)
+        and not _is_preemptable(holder_pid, holder_role)
+    )
+    if holder_is_backup:
+        os.close(fd)
+        raise WorkLockHeldByBackup()
+
+    can_preempt = bool(
+        holder_pid
+        and holder_pid != os.getpid()
+        and _pid_alive(holder_pid)
+        and _is_preemptable(holder_pid, holder_role)
+    )
+    if can_preempt:
+        _preempt_holder(holder_pid, holder_pgid or holder_pid)
+        deadline = time.time() + PREEMPT_WAIT_SEC
+        while time.time() < deadline:
+            if _try_flock(fd):
+                _write_lock_meta(role, dest)
+                return fd
+            time.sleep(0.2)
+
+    os.close(fd)
+    retry_meta = _read_lock_meta()
+    retry_role = str((retry_meta or {}).get("role") or "")
+    if retry_role == WORK_ROLE_BACKUP:
+        raise WorkLockHeldByBackup()
+    if can_preempt:
+        raise AppError("Could not stop the unbacked-up scan to start a backup")
+    raise WorkLockHeldByBackup()
+
+
+def release_work_lock(fd: int) -> None:
+    _clear_lock_meta()
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+@contextmanager
+def acquire_work_lock(role: str, dest: str = "", *, preempt_pending: bool = False) -> Iterator[None]:
+    fd = acquire_exclusive_work_lock(role, dest, preempt_pending=preempt_pending)
+    try:
+        yield
+    finally:
+        release_work_lock(fd)
+
+
+def run_command_tracked(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    track_child(proc)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+        raise
+    finally:
+        untrack_child(proc)
+    return subprocess.CompletedProcess(cmd, proc.returncode or 0, stdout, stderr)
+
+
+def write_secret_file(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o600)
+
+
+RESTIC_FALLBACKS = (
+    "/usr/bin/restic",
+    "/usr/local/bin/restic",
+)
+
+
+def restic_bin() -> str:
+    found = shutil.which("restic")
+    if found and Path(found).is_file():
+        return found
+    for candidate in RESTIC_FALLBACKS:
+        path = Path(candidate)
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    raise AppError("restic is not installed. Run: omarchy pkg add restic")
+
+
+def restic_installed() -> bool:
+    try:
+        restic_bin()
+    except AppError:
+        return False
+    return True
+
+
+def merge_env_file(name: str, updates: dict[str, str]) -> None:
+    path = env_path(name)
+    values: dict[str, str] = {}
+    if path.is_file():
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    values.update(updates)
+    write_secret_file(path, "".join(f"{key}={values[key]}\n" for key in values))
+
+
+def parse_b2_repo(repo: str) -> tuple[str, str] | None:
+    if not repo.startswith("b2:"):
+        return None
+    rest = repo[3:]
+    if ":" in rest:
+        bucket, prefix = rest.split(":", 1)
+    else:
+        bucket, prefix = rest, ""
+    bucket = bucket.strip()
+    prefix = prefix.strip().strip("/")
+    if not bucket:
+        return None
+    return bucket, prefix
+
+
+def b2_authorize(key_id: str, application_key: str) -> dict[str, Any]:
+    import base64
+    import urllib.error
+    import urllib.request
+
+    token = base64.b64encode(f"{key_id}:{application_key}".encode("utf-8")).decode("ascii")
+    request = urllib.request.Request(
+        "https://api.backblazeb2.com/b2api/v2/b2_authorize_account",
+        headers={"Authorization": f"Basic {token}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise AppError(
+                "Backblaze rejected keyID / applicationKey. Copy both from Application Keys — keyID is the keyID column, not the master account ID."
+            ) from exc
+        raise AppError(f"Backblaze login failed ({exc.code}).") from exc
+    except urllib.error.URLError as exc:
+        raise AppError("Could not reach Backblaze. Check the network and try again.") from exc
+    if not isinstance(payload, dict):
+        raise AppError("Backblaze returned an invalid login response")
+    return payload
+
+
+def upgrade_b2_repo(name: str, cfg: dict[str, Any], dest: dict[str, Any]) -> dict[str, Any]:
+    parsed = parse_b2_repo(str(dest.get("repository") or ""))
+    if parsed is None:
+        return dest
+    env = load_dest_env(name)
+    key_id = env.get("B2_ACCOUNT_ID") or env.get("AWS_ACCESS_KEY_ID") or ""
+    application_key = env.get("B2_ACCOUNT_KEY") or env.get("AWS_SECRET_ACCESS_KEY") or ""
+    if not key_id or not application_key:
+        raise AppError("Backblaze keyID and applicationKey are required")
+    auth = b2_authorize(key_id, application_key)
+    s3_url = str(auth.get("s3ApiUrl") or "").rstrip("/")
+    if not s3_url:
+        raise AppError("Backblaze did not return an S3 endpoint for this key")
+    host = s3_url.split("://", 1)[-1]
+    bucket, prefix = parsed
+    dest["repository"] = f"s3:{host}/{bucket}" + (f"/{prefix}" if prefix else "")
+    region = "us-west-000"
+    parts = host.split(".")
+    if len(parts) > 2 and parts[0] == "s3":
+        region = parts[1]
+    merge_env_file(
+        name,
+        {
+            "AWS_ACCESS_KEY_ID": key_id,
+            "AWS_SECRET_ACCESS_KEY": application_key,
+            "AWS_DEFAULT_REGION": region,
+            "AWS_EC2_METADATA_DISABLED": "true",
+        },
+    )
+    save_config(cfg)
+    return dest
+
+
+def prepare_dest(name: str) -> dict[str, Any]:
+    cfg = load_config()
+    dest = find_dest(cfg, name)
+    if str(dest.get("repository") or "").startswith("b2:"):
+        return upgrade_b2_repo(name, cfg, dest)
+    return dest
+
+
+def restic_cloud_error(message: str) -> str:
+    lower = message.lower()
+    if "401" in lower or "unauthorized" in lower:
+        return (
+            "Backblaze returned 401. Check keyID and applicationKey, "
+            "and that the bucket already exists. A restricted key cannot create buckets."
+        )
+    return message
+
+
+def load_dest_env(name: str) -> dict[str, str]:
+    env = dict(os.environ)
+    env["AWS_EC2_METADATA_DISABLED"] = "true"
+    path = env_path(name)
+    if path.is_file():
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            env[key.strip()] = value.strip().strip('"').strip("'")
+    pw = password_path(name)
+    if pw.is_file():
+        env["RESTIC_PASSWORD_FILE"] = str(pw)
+    dest = None
+    try:
+        dest = find_dest(load_config(), name)
+    except AppError:
+        dest = None
+    if dest:
+        env["RESTIC_REPOSITORY"] = str(dest.get("repository", ""))
+    return env
+
+
+def run_pre_command(dest: dict[str, Any]) -> None:
+    cmd = str(dest.get("pre_command") or "").strip()
+    if not cmd:
+        return
+    result = subprocess.run(cmd, shell=True, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "pre_command failed").strip()
+        raise AppError(f"Wake command failed: {err}")
+
+
+def run_restic(
+    name: str,
+    args: list[str],
+    check: bool = True,
+    timeout: float | None = None,
+    rate_limit: bool = False,
+    tracked: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    dest = prepare_dest(name)
+    run_pre_command(dest)
+    if not password_path(name).is_file():
+        raise AppError(f"No password set for {name}. Run: omackup key set --dest {name}")
+    repo = str(dest.get("repository") or "")
+    if not repo:
+        raise AppError(f"Destination {name} has no repository")
+    limits = restic_rate_limit_args(dest) if rate_limit else []
+    cmd = [restic_bin(), *limits, "-r", repo, *args]
+    env = load_dest_env(name)
+    try:
+        if tracked:
+            result = run_command_tracked(cmd, env=env, timeout=timeout)
+        else:
+            result = subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                timeout=timeout,
+            )
+    except subprocess.TimeoutExpired as exc:
+        raise AppError("Timed out talking to the backup destination.") from exc
+    if check and result.returncode != 0:
+        err = (result.stderr or result.stdout or "restic failed").strip()
+        raise AppError(restic_cloud_error(err))
+    return result
+
+
+def write_exclude_file(cfg: dict[str, Any]) -> Path:
+    path = DATA_DIR / "excludes.txt"
+    lines = [str(item) for item in cfg.get("excludes", []) if str(item).strip()]
+    for item in cfg.get("exclude_paths", []):
+        raw = str(item).strip()
+        if raw and raw not in lines:
+            lines.append(str(expand_path(raw)))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def source_paths(cfg: dict[str, Any]) -> list[Path]:
+    paths: list[Path] = []
+    for raw in cfg.get("sources", ["~"]):
+        path = expand_path(str(raw))
+        if not path.exists():
+            raise AppError(f"Source does not exist: {path}")
+        paths.append(path)
+    if not paths:
+        raise AppError("No source folders configured")
+    return paths
+
+
+def tcp_reachable(host: str, port: int, timeout: float = 1.5) -> bool:
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def s3_or_b2_endpoint(repo: str) -> tuple[str, int] | None:
+    raw = str(repo or "").strip()
+    if raw.startswith("b2:"):
+        return "api.backblazeb2.com", 443
+    if raw.startswith("s3:"):
+        raw = raw[3:]
+    else:
+        return None
+    raw = raw.lstrip("/")
+    if raw.startswith("https://"):
+        raw = raw[8:]
+    elif raw.startswith("http://"):
+        raw = raw[7:]
+    host = raw.split("/", 1)[0].strip()
+    if not host:
+        return None
+    if ":" in host:
+        name, port_text = host.rsplit(":", 1)
+        if name and port_text.isdigit():
+            return name, int(port_text)
+    return host, 443
+
+
+def sftp_endpoint(repo: str) -> tuple[str, int] | None:
+    raw = repo[5:] if repo.startswith("sftp:") else repo
+    raw = raw.lstrip("/")
+    if "@" in raw:
+        raw = raw.split("@", 1)[1]
+    host_part = raw.split(":", 1)[0] if ":" in raw else raw.split("/", 1)[0]
+    host = host_part.strip()
+    if not host:
+        return None
+    return host, 22
+
+
+def dest_reachable(dest: dict[str, Any]) -> tuple[bool, str]:
+    name = safe_name(str(dest.get("name", "")))
+    if not password_path(name).is_file():
+        return False, "No password set"
+    repo = str(dest.get("repository") or "")
+    if not repo:
+        return False, "No repository"
+    kind = str(dest.get("kind") or "usb")
+
+    if kind == "usb" or not repo.startswith(("sftp:", "s3:", "b2:", "rest:", "rclone:")):
+        path = Path(repo)
+        if path.exists() or path.parent.exists():
+            return True, ""
+        return False, "Backup drive is not mounted"
+
+    if kind == "nas" or repo.startswith("sftp:"):
+        endpoint = sftp_endpoint(repo)
+        if not endpoint:
+            return False, "Invalid NAS repository"
+        host, port = endpoint
+        if tcp_reachable(host, port):
+            return True, ""
+        return False, "NAS is not reachable"
+
+    if kind == "cloud" or repo.startswith(("s3:", "b2:")):
+        if not env_path(name).is_file():
+            return False, "Cloud credentials missing"
+        endpoint = s3_or_b2_endpoint(repo)
+        if not endpoint:
+            return False, "Invalid cloud repository"
+        host, port = endpoint
+        if tcp_reachable(host, port):
+            return True, ""
+        return False, "No connection to cloud destination"
+
+    return True, ""
+
+
+def dest_public(dest: dict[str, Any]) -> dict[str, Any]:
+    name = safe_name(str(dest.get("name", "")))
+    state = load_state(name)
+    schedule = str(dest.get("schedule") or "")
+    last_success = int(state.get("last_success") or 0)
+    last_failure = int(state.get("last_failure") or 0)
+    overdue = False
+    if schedule and last_success:
+        overdue = (time.time() - last_success) > (36 * 3600)
+    elif schedule and not last_success:
+        overdue = True
+    failed = last_failure > last_success
+    initialized = bool(state.get("initialized"))
+    repo = str(dest.get("repository") or "")
+    if repo and not repo.startswith(("sftp:", "s3:", "b2:", "rest:", "rclone:")):
+        initialized = initialized or (Path(repo) / "config").is_file() or (Path(repo) / "config").exists()
+    if password_path(name).is_file() and last_success:
+        initialized = True
+    reachable, reachable_error = dest_reachable(dest)
+    return {
+        "name": name,
+        "display_name": str(dest.get("display_name") or name),
+        "kind": str(dest.get("kind") or "usb"),
+        "repository": repo,
+        "schedule": schedule,
+        "pre_command": str(dest.get("pre_command") or ""),
+        "rate_limit_kibs": normalize_rate_limit_kibs(dest.get("rate_limit_kibs") or 0),
+        "retention": dest.get("retention") or dict(DEFAULT_RETENTION),
+        "has_password": password_path(name).is_file(),
+        "initialized": initialized,
+        "reachable": reachable,
+        "reachable_error": reachable_error,
+        "last_success": last_success,
+        "last_failure": last_failure,
+        "last_error": str(state.get("last_error") or ""),
+        "last_duration_sec": int(state.get("last_duration_sec") or 0),
+        "pending_files": int(state.get("pending_files") or 0),
+        "pending_new": int(state.get("pending_new") or 0),
+        "pending_changed": int(state.get("pending_changed") or 0),
+        "pending_checked_at": int(state.get("pending_checked_at") or 0),
+        "pending_since": (
+            int(state.get("pending_since") or 0)
+            or int(state.get("pending_checked_at") or 0)
+            if int(state.get("pending_files") or 0) > 0
+            else 0
+        ),
+        "overdue": overdue,
+        "failed": failed,
+    }
+
+
+def format_when(ts: int) -> str:
+    if not ts:
+        return "never"
+    dt = datetime.fromtimestamp(ts)
+    now = datetime.now()
+    if dt.date() == now.date():
+        return f"Today, {dt.strftime('%H:%M')}"
+    if (now.date() - dt.date()).days == 1:
+        return f"Yesterday, {dt.strftime('%H:%M')}"
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def launcher_menu_block() -> str:
+    entry = (
+        '"trigger.omackup": {'
+        '"icon":"󰁯",'
+        '"label":"Omackup",'
+        '"description":"Backup personal files to USB, NAS, or cloud",'
+        '"aliases":["omackup","backup"],'
+        f'"action":"{LAUNCHER_SUMMON}"'
+        "}"
+    )
+    return f"  {LAUNCHER_MENU_BEGIN}\n  {entry},\n  {LAUNCHER_MENU_END}\n"
+
+
+def launcher_menu_has_block(text: str) -> bool:
+    return LAUNCHER_MENU_BEGIN in text and LAUNCHER_MENU_END in text
+
+
+def replace_launcher_menu_block(text: str, block: str) -> str:
+    start = text.find(LAUNCHER_MENU_BEGIN)
+    end = text.find(LAUNCHER_MENU_END)
+    if start >= 0 and end >= start:
+        line_start = text.rfind("\n", 0, start) + 1
+        after = end + len(LAUNCHER_MENU_END)
+        if after < len(text) and text[after] == "\n":
+            after += 1
+        return text[:line_start] + block + text[after:]
+    stripped = text.rstrip()
+    if stripped.endswith("}"):
+        return stripped[:-1].rstrip() + "\n" + block + "}\n"
+    if not stripped:
+        return "{\n" + block + "}\n"
+    return stripped + "\n" + block
+
+
+def remove_launcher_menu_block(text: str) -> str:
+    start = text.find(LAUNCHER_MENU_BEGIN)
+    end = text.find(LAUNCHER_MENU_END)
+    if start < 0 or end < start:
+        return text
+    line_start = text.rfind("\n", 0, start) + 1
+    after = end + len(LAUNCHER_MENU_END)
+    if after < len(text) and text[after] == "\n":
+        after += 1
+    return text[:line_start] + text[after:]
+
+
+def ensure_launcher(*, force: bool = False) -> dict[str, bool]:
+    """Install the Super+Space menu row. No-op when already current."""
+    changed = {"menu": False}
+    if LAUNCHER_DESKTOP_PATH.is_file() and LAUNCHER_DESKTOP_PATH.read_text(encoding="utf-8").find("gravey.omackup") != -1:
+        LAUNCHER_DESKTOP_PATH.unlink(missing_ok=True)
+        subprocess.run(["update-desktop-database", str(LAUNCHER_DESKTOP_PATH.parent)], check=False, capture_output=True)
+
+    menu_block = launcher_menu_block()
+    if LAUNCHER_MENU_PATH.is_file():
+        current = LAUNCHER_MENU_PATH.read_text(encoding="utf-8")
+    else:
+        current = "{\n}\n"
+    if launcher_menu_has_block(current):
+        next_text = replace_launcher_menu_block(current, menu_block)
+        if next_text != current:
+            LAUNCHER_MENU_PATH.parent.mkdir(parents=True, exist_ok=True)
+            LAUNCHER_MENU_PATH.write_text(next_text, encoding="utf-8")
+            changed["menu"] = True
+    elif force or not LAUNCHER_STAMP.is_file():
+        next_text = replace_launcher_menu_block(current, menu_block)
+        if next_text != current:
+            LAUNCHER_MENU_PATH.parent.mkdir(parents=True, exist_ok=True)
+            LAUNCHER_MENU_PATH.write_text(next_text, encoding="utf-8")
+            changed["menu"] = True
+
+    if force or changed["menu"] or not LAUNCHER_STAMP.is_file():
+        LAUNCHER_STAMP.parent.mkdir(parents=True, exist_ok=True)
+        LAUNCHER_STAMP.write_text("1\n", encoding="utf-8")
+    return changed
+
+
+def uninstall_launcher() -> dict[str, bool]:
+    removed = {"menu": False, "desktop": False}
+    if LAUNCHER_DESKTOP_PATH.is_file() and LAUNCHER_DESKTOP_PATH.read_text(encoding="utf-8").find("gravey.omackup") != -1:
+        LAUNCHER_DESKTOP_PATH.unlink(missing_ok=True)
+        removed["desktop"] = True
+    if LAUNCHER_MENU_PATH.is_file():
+        current = LAUNCHER_MENU_PATH.read_text(encoding="utf-8")
+        if launcher_menu_has_block(current):
+            LAUNCHER_MENU_PATH.write_text(remove_launcher_menu_block(current), encoding="utf-8")
+            removed["menu"] = True
+    LAUNCHER_STAMP.unlink(missing_ok=True)
+    return removed
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    try:
+        ensure_launcher()
+    except Exception:
+        pass
+    installed = restic_installed()
+    cfg = load_config()
+    dests = [dest_public(d) for d in cfg.get("destinations", [])]
+    alert = False
+    status = "Not configured"
+    detail = "Add a destination to start backing up"
+    if not installed:
+        status = "restic missing"
+        detail = "Install restic with omarchy pkg add restic"
+        alert = True
+    elif dests:
+        worst = dests[0]
+        for dest in dests:
+            if dest["failed"] or dest["overdue"]:
+                worst = dest
+                break
+            if dest["last_success"] > worst["last_success"]:
+                worst = dest
+        if any(d["failed"] for d in dests):
+            alert = True
+            failed = next(d for d in dests if d["failed"])
+            status = "Backup failed"
+            detail = failed["last_error"] or failed["display_name"]
+        elif any(d["overdue"] for d in dests):
+            alert = True
+            overdue = next(d for d in dests if d["overdue"])
+            status = "Backup overdue"
+            detail = overdue["display_name"]
+        elif any(d["last_success"] for d in dests):
+            newest = max(dests, key=lambda d: int(d["last_success"] or 0))
+            status = format_when(int(newest["last_success"]))
+            detail = newest["display_name"]
+            pending_total = sum(int(d.get("pending_files") or 0) for d in dests)
+            if pending_total > 0:
+                status = f"{pending_total} file{'s' if pending_total != 1 else ''} to back up"
+                dirty = next((d for d in dests if int(d.get("pending_files") or 0) > 0), newest)
+                detail = dirty["display_name"]
+        else:
+            status = "Never backed up"
+            detail = dests[0]["display_name"]
+    return emit(
+        {
+            "ok": True,
+            "restic_installed": installed,
+            "sources": cfg.get("sources", ["~"]),
+            "excludes": cfg.get("excludes", []),
+            "exclude_paths": cfg.get("exclude_paths", []),
+            "destinations": dests,
+            "pending_files": sum(int(d.get("pending_files") or 0) for d in dests),
+            "active_backup": active_backup_status(),
+            "bar": {"alert": alert, "status": status, "detail": detail},
+        }
+    )
+
+
+def cmd_destinations(_args: argparse.Namespace) -> int:
+    cfg = load_config()
+    return emit({"ok": True, "destinations": [dest_public(d) for d in cfg.get("destinations", [])]})
+
+
+def upsert_dest(cfg: dict[str, Any], dest: dict[str, Any]) -> dict[str, Any]:
+    name = safe_name(str(dest["name"]))
+    dest["name"] = name
+    existing = None
+    for item in cfg["destinations"]:
+        if safe_name(str(item.get("name", ""))) == name:
+            existing = item
+            break
+    if existing is None:
+        cfg["destinations"].append(dest)
+    else:
+        existing.update(dest)
+        dest = existing
+    save_config(cfg)
+    return dest
+
+
+def cmd_dest_add(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    name = safe_name(args.name)
+    kind = args.kind
+    repo = args.repository.strip()
+    if kind == "usb":
+        path = expand_path(repo)
+        path.mkdir(parents=True, exist_ok=True)
+        repo = str(path)
+    dest = {
+        "name": name,
+        "display_name": args.display_name or name,
+        "kind": kind,
+        "repository": repo,
+        "schedule": args.schedule or "",
+        "pre_command": args.pre_command or "",
+        "retention": dict(DEFAULT_RETENTION),
+    }
+    if args.rate_limit_kibs is not None:
+        dest["rate_limit_kibs"] = normalize_rate_limit_kibs(args.rate_limit_kibs)
+    upsert_dest(cfg, dest)
+    if args.password:
+        write_secret_file(password_path(name), args.password.strip() + "\n")
+    if args.env:
+        existing = ""
+        if env_path(name).is_file():
+            existing = env_path(name).read_text(encoding="utf-8")
+        lines = [line for line in existing.splitlines() if line.strip()]
+        keys = {line.split("=", 1)[0] for line in lines if "=" in line}
+        for item in args.env:
+            if "=" not in item:
+                raise AppError(f"Invalid env entry: {item}")
+            key, value = item.split("=", 1)
+            if key in keys:
+                lines = [line for line in lines if not line.startswith(key + "=")]
+            lines.append(f"{key}={value}")
+        write_secret_file(env_path(name), "\n".join(lines) + "\n")
+    try:
+        install_schedules()
+    except AppError:
+        pass
+    return emit({"ok": True, "destination": dest_public(find_dest(load_config(), name))})
+
+
+def cmd_dest_remove(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    name = safe_name(args.name)
+    before = len(cfg["destinations"])
+    cfg["destinations"] = [
+        dest for dest in cfg["destinations"] if safe_name(str(dest.get("name", ""))) != name
+    ]
+    if len(cfg["destinations"]) == before:
+        raise AppError(f"Unknown destination: {args.name}")
+    save_config(cfg)
+    try:
+        install_schedules()
+    except AppError:
+        pass
+    return emit({"ok": True, "removed": name})
+
+
+def cmd_dest_get(args: argparse.Namespace) -> int:
+    dest = find_dest(load_config(), args.name)
+    return emit({"ok": True, "destination": dest_public(dest)})
+
+
+def cmd_sources(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    if args.action == "list" or args.action is None:
+        return emit({"ok": True, "sources": cfg.get("sources", ["~"])})
+    if args.action == "set":
+        for path in args.paths:
+            if not expand_path(path).exists():
+                raise AppError(f"Source does not exist: {path}")
+        cfg["sources"] = args.paths
+        save_config(cfg)
+        return emit({"ok": True, "sources": cfg["sources"]})
+    if args.action == "add":
+        if not args.paths:
+            raise AppError("Provide a source path")
+        path = args.paths[0]
+        if not expand_path(path).exists():
+            raise AppError(f"Source does not exist: {path}")
+        sources = list(cfg.get("sources", []))
+        if path not in sources and str(expand_path(path)) not in [str(expand_path(s)) for s in sources]:
+            sources.append(path)
+        cfg["sources"] = sources
+        save_config(cfg)
+        return emit({"ok": True, "sources": cfg["sources"]})
+    if args.action == "remove":
+        if not args.paths:
+            raise AppError("Provide a source path")
+        target = str(expand_path(args.paths[0]))
+        cfg["sources"] = [s for s in cfg.get("sources", []) if str(expand_path(s)) != target]
+        if not cfg["sources"]:
+            cfg["sources"] = ["~"]
+        save_config(cfg)
+        return emit({"ok": True, "sources": cfg["sources"]})
+    raise AppError(f"Unknown sources action: {args.action}")
+
+
+def cmd_exclude(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    excludes = list(cfg.get("excludes", []))
+    if args.action == "list":
+        return emit({"ok": True, "excludes": excludes})
+    if args.action == "add":
+        if not args.pattern:
+            raise AppError("Provide an exclude pattern")
+        if args.pattern not in excludes:
+            excludes.append(args.pattern)
+        cfg["excludes"] = excludes
+        save_config(cfg)
+        return emit({"ok": True, "excludes": cfg["excludes"]})
+    if args.action == "remove":
+        if not args.pattern:
+            raise AppError("Provide an exclude pattern")
+        cfg["excludes"] = [item for item in excludes if item != args.pattern]
+        save_config(cfg)
+        return emit({"ok": True, "excludes": cfg["excludes"]})
+    if args.action == "replace":
+        if not args.pattern or args.new_pattern is None:
+            raise AppError("Provide the old and new exclude patterns")
+        old = str(args.pattern)
+        new = str(args.new_pattern).strip()
+        if not new:
+            raise AppError("New exclude pattern cannot be empty")
+        if old not in excludes:
+            raise AppError(f"Exclude pattern not found: {old}")
+        if new == old:
+            return emit({"ok": True, "excludes": excludes})
+        next_excludes: list[str] = []
+        inserted = False
+        for item in excludes:
+            if item == old:
+                if new not in excludes and not inserted:
+                    next_excludes.append(new)
+                    inserted = True
+                continue
+            if item == new:
+                next_excludes.append(item)
+                inserted = True
+                continue
+            next_excludes.append(item)
+        if not inserted:
+            next_excludes.append(new)
+        cfg["excludes"] = next_excludes
+        save_config(cfg)
+        return emit({"ok": True, "excludes": cfg["excludes"]})
+    if args.action == "reset":
+        cfg["excludes"] = read_default_excludes()
+        save_config(cfg)
+        return emit({"ok": True, "excludes": cfg["excludes"]})
+    if args.action == "defaults":
+        return emit({"ok": True, "excludes": read_default_excludes()})
+    raise AppError(f"Unknown exclude action: {args.action}")
+
+
+def cmd_selection_set(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    try:
+        payload = json.loads(args.json)
+    except json.JSONDecodeError as exc:
+        raise AppError(f"Invalid selection JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise AppError("Selection JSON must be an object")
+    sources = payload.get("sources")
+    exclude_paths = payload.get("exclude_paths")
+    if not isinstance(sources, list) or not isinstance(exclude_paths, list):
+        raise AppError("sources and exclude_paths must be arrays")
+    for path in sources:
+        if not expand_path(str(path)).exists():
+            raise AppError(f"Source does not exist: {path}")
+    cfg["sources"] = [str(path) for path in sources]
+    cfg["exclude_paths"] = [str(path) for path in exclude_paths]
+    if "excludes" in payload:
+        excludes = payload.get("excludes")
+        if not isinstance(excludes, list):
+            raise AppError("excludes must be an array")
+        cfg["excludes"] = [str(item) for item in excludes if str(item).strip()]
+    save_config(cfg)
+    return emit(
+        {
+            "ok": True,
+            "sources": cfg["sources"],
+            "exclude_paths": cfg["exclude_paths"],
+            "excludes": cfg.get("excludes", []),
+        }
+    )
+
+
+def _glob_special_to_re(pattern: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "*" and i + 1 < n and pattern[i + 1] == "*":
+            if i + 2 >= n:
+                if out and out[-1] == "/":
+                    out[-1] = "(?:/.*)?"
+                else:
+                    out.append(".*")
+                i += 2
+                continue
+            if pattern[i + 2] == "/":
+                out.append("(?:.*/)?")
+                i += 3
+                continue
+            out.append(".*")
+            i += 2
+            continue
+        if c == "*":
+            out.append("[^/]*")
+            i += 1
+            continue
+        if c == "?":
+            out.append("[^/]")
+            i += 1
+            continue
+        if c == "[":
+            close = pattern.find("]", i + 1)
+            if close < 0:
+                out.append(re.escape(c))
+                i += 1
+                continue
+            out.append(pattern[i : close + 1])
+            i = close + 1
+            continue
+        out.append(re.escape(c))
+        i += 1
+    return "".join(out)
+
+
+def compile_exclude_patterns(patterns: list[str]) -> list[dict[str, Any]]:
+    compiled: list[dict[str, Any]] = []
+    for pattern in patterns:
+        raw = str(pattern or "").strip()
+        if not raw or raw.startswith("#") or raw.startswith("!"):
+            continue
+        dir_only = raw.endswith("/")
+        body = raw.rstrip("/") if dir_only else raw
+        anchored = body.startswith("/")
+        if anchored:
+            body = body[1:]
+        anywhere = (not anchored) and ("/" not in body)
+        try:
+            inner = _glob_special_to_re(body)
+            rx = re.compile((rf"(?:^|/){inner}$" if anywhere else rf"^{inner}$"))
+        except re.error:
+            continue
+        compiled.append({"pattern": raw, "dir_only": dir_only, "rx": rx})
+    return compiled
+
+
+def pattern_excludes(rel_path: str, is_dir: bool, compiled: list[dict[str, Any]]) -> bool:
+    for item in compiled:
+        if item["dir_only"] and not is_dir:
+            continue
+        if item["rx"].search(rel_path):
+            return True
+    return False
+
+
+def measure_selection(
+    sources_raw: list[Any],
+    exclude_paths_raw: list[Any],
+    patterns_raw: list[Any],
+) -> dict[str, Any]:
+    home = Path.home().resolve()
+    home_prefix = str(home) + "/"
+    sources = [expand_path(str(item)) for item in sources_raw]
+    exclude_abs: list[str] = []
+    for item in exclude_paths_raw:
+        try:
+            exclude_abs.append(str(expand_path(str(item)).resolve()))
+        except OSError:
+            exclude_abs.append(str(expand_path(str(item))))
+    compiled = compile_exclude_patterns([str(item) for item in patterns_raw if str(item).strip()])
+
+    total = 0
+    files = 0
+    skipped = 0
+    errors = 0
+
+    def rel_to_home(abspath: str) -> str:
+        if abspath == str(home):
+            return ""
+        if abspath.startswith(home_prefix):
+            return abspath[len(home_prefix) :]
+        return abspath[1:] if abspath.startswith("/") else abspath
+
+    def under_exclude_path(abspath: str) -> bool:
+        for excluded in exclude_abs:
+            if abspath == excluded or abspath.startswith(excluded + "/"):
+                return True
+        return False
+
+    def should_skip(abspath: str, is_dir: bool) -> bool:
+        nonlocal skipped
+        if under_exclude_path(abspath):
+            skipped += 1
+            return True
+        if pattern_excludes(rel_to_home(abspath), is_dir, compiled):
+            skipped += 1
+            return True
+        return False
+
+    for source in sources:
+        try:
+            source_abs = str(source.resolve())
+        except OSError:
+            source_abs = str(source)
+        if not os.path.exists(source_abs):
+            errors += 1
+            continue
+
+        try:
+            st = os.lstat(source_abs)
+        except OSError:
+            errors += 1
+            continue
+
+        is_dir = stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode)
+
+        if not is_dir:
+            if should_skip(source_abs, False):
+                continue
+            total += st.st_size
+            files += 1
+            continue
+
+        if should_skip(source_abs, True):
+            continue
+
+        root_dev = st.st_dev
+        for dirpath, dirnames, filenames in os.walk(source_abs, topdown=True, followlinks=False):
+            try:
+                dst = os.lstat(dirpath).st_dev
+            except OSError:
+                errors += 1
+                dirnames[:] = []
+                continue
+            if dst != root_dev:
+                dirnames[:] = []
+                continue
+
+            keep_dirs: list[str] = []
+            for name in dirnames:
+                child = os.path.join(dirpath, name)
+                try:
+                    cst = os.lstat(child)
+                except OSError:
+                    errors += 1
+                    continue
+                if stat.S_ISLNK(cst.st_mode):
+                    continue
+                if should_skip(child, True):
+                    continue
+                keep_dirs.append(name)
+            dirnames[:] = keep_dirs
+
+            for name in filenames:
+                child = os.path.join(dirpath, name)
+                try:
+                    cst = os.lstat(child)
+                except OSError:
+                    errors += 1
+                    continue
+                if stat.S_ISLNK(cst.st_mode):
+                    continue
+                if not stat.S_ISREG(cst.st_mode):
+                    continue
+                if should_skip(child, False):
+                    continue
+                total += cst.st_size
+                files += 1
+
+    return {
+        "bytes": total,
+        "files": files,
+        "skipped": skipped,
+        "errors": errors,
+        "sources": [str(path) for path in sources],
+    }
+
+
+def as_string_list(value: Any, field: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, dict):
+        def sort_key(key: Any) -> tuple[int, str]:
+            text = str(key)
+            return (0, f"{int(text):010d}") if text.isdigit() else (1, text)
+
+        return [str(value[key]) for key in sorted(value.keys(), key=sort_key)]
+    raise AppError(f"{field} must be an array")
+
+
+def cmd_selection_size(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    sources_raw = cfg.get("sources", [])
+    exclude_paths_raw = cfg.get("exclude_paths", [])
+    patterns_raw = cfg.get("excludes", [])
+    if getattr(args, "json", None):
+        try:
+            payload = json.loads(args.json)
+        except json.JSONDecodeError as exc:
+            raise AppError(f"Invalid selection JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise AppError("Selection JSON must be an object")
+        if "sources" in payload:
+            sources_raw = as_string_list(payload["sources"], "sources")
+        if "exclude_paths" in payload:
+            exclude_paths_raw = as_string_list(payload["exclude_paths"], "exclude_paths")
+        if "excludes" in payload:
+            patterns_raw = as_string_list(payload["excludes"], "excludes")
+
+    try:
+        with acquire_work_lock(WORK_ROLE_SELECTION_SIZE):
+            measured = measure_selection(sources_raw, exclude_paths_raw, patterns_raw)
+    except WorkLockBusy:
+        json.dump({"ok": True, "skipped": True, "reason": "busy"}, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        return 0
+    json.dump({"ok": True, **measured}, sys.stdout, separators=(",", ":"), default=str)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return 0
+
+
+def generate_password() -> str:
+    return secrets.token_urlsafe(24)
+
+
+def cmd_key_set(args: argparse.Namespace) -> int:
+    name = safe_name(args.dest)
+    find_dest(load_config(), name)
+    password = (args.password or "").strip() or generate_password()
+    write_secret_file(password_path(name), password + "\n")
+    generated = not bool((args.password or "").strip())
+    return emit(
+        {
+            "ok": True,
+            "dest": name,
+            "generated": generated,
+            "password": password,
+            "warning": (
+                "Save this password off this machine. The copy stored here lives "
+                "in your home folder. If this computer dies, the backups are "
+                "unreadable without an off-machine copy."
+            ),
+        }
+    )
+
+
+def cmd_key_show(args: argparse.Namespace) -> int:
+    name = safe_name(args.dest)
+    path = password_path(name)
+    if not path.is_file():
+        raise AppError(f"No password set for {name}")
+    password = path.read_text(encoding="utf-8").strip()
+    return emit(
+        {
+            "ok": True,
+            "dest": name,
+            "password": password,
+            "warning": "Save this password in a password manager that is not only on this computer.",
+        }
+    )
+
+
+def cmd_key_generate(_args: argparse.Namespace) -> int:
+    return emit({"ok": True, "password": generate_password()})
+
+
+def cmd_env_set(args: argparse.Namespace) -> int:
+    name = safe_name(args.dest)
+    find_dest(load_config(), name)
+    lines: list[str] = []
+    if env_path(name).is_file():
+        lines = [line for line in env_path(name).read_text(encoding="utf-8").splitlines() if line.strip()]
+    keys = {line.split("=", 1)[0] for line in lines if "=" in line}
+    for item in args.pairs:
+        if "=" not in item:
+            raise AppError(f"Invalid env entry: {item}")
+        key, value = item.split("=", 1)
+        if key in keys:
+            lines = [line for line in lines if not line.startswith(key + "=")]
+        lines.append(f"{key}={value}")
+        keys.add(key)
+    write_secret_file(env_path(name), "\n".join(lines) + "\n")
+    return emit({"ok": True, "dest": name, "keys": sorted(keys)})
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    name = safe_name(args.dest)
+    dest = find_dest(load_config(), name)
+    if not password_path(name).is_file():
+        write_secret_file(password_path(name), generate_password() + "\n")
+    repo = str(dest.get("repository") or "")
+    if dest.get("kind") == "usb" or (repo.startswith("/") and not repo.startswith("sftp:")):
+        Path(repo).mkdir(parents=True, exist_ok=True)
+    result = run_restic(name, ["init"], check=False, timeout=90)
+    already = "already initialized" in (result.stderr + result.stdout).lower()
+    if result.returncode != 0 and not already:
+        raise AppError(restic_cloud_error((result.stderr or result.stdout or "restic init failed").strip()))
+    state = load_state(name)
+    state["initialized"] = True
+    save_state(name, state)
+    return emit({"ok": True, "dest": name, "already_initialized": already})
+
+
+def parse_backup_summary(stdout: str) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("message_type") == "summary":
+            summary = obj
+    return summary
+
+
+def clamp_progress(value: float) -> float:
+    if value < 0:
+        return 0.0
+    if value > 1:
+        return 1.0
+    return value
+
+
+def backup_percent(bytes_done: int, total_bytes: int, files_done: int, total_files: int) -> float:
+    if total_bytes > 0:
+        return clamp_progress(bytes_done / total_bytes)
+    if total_files > 0:
+        return clamp_progress(files_done / total_files)
+    return 0.0
+
+
+def backup_progress_payload(
+    *,
+    phase: str,
+    percent: float,
+    eta_seconds: int,
+    seconds_elapsed: int,
+    bytes_done: int,
+    total_bytes: int,
+    bytes_per_second: float,
+    files_done: int,
+    total_files: int,
+    error_count: int = 0,
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "event": "progress",
+        "phase": phase,
+        "percent": clamp_progress(percent),
+        "eta_seconds": eta_seconds,
+        "seconds_elapsed": seconds_elapsed,
+        "bytes_done": bytes_done,
+        "total_bytes": total_bytes,
+        "bytes_per_second": bytes_per_second,
+        "files_done": files_done,
+        "total_files": total_files,
+        "error_count": error_count,
+    }
+
+
+def progress_from_restic_status(
+    obj: dict[str, Any],
+    *,
+    total_bytes: int,
+    total_files: int,
+    started_at: float,
+) -> dict[str, Any]:
+    bytes_done = int(obj.get("bytes_done") or 0)
+    files_done = int(obj.get("files_done") or 0)
+    percent_f = backup_percent(bytes_done, total_bytes, files_done, total_files)
+
+    elapsed = obj.get("seconds_elapsed")
+    try:
+        elapsed_i = int(elapsed) if elapsed is not None else 0
+    except (TypeError, ValueError):
+        elapsed_i = 0
+    if elapsed_i <= 0 and started_at > 0:
+        elapsed_i = max(0, int(time.time() - started_at))
+
+    eta = obj.get("seconds_remaining")
+    try:
+        eta_i = int(eta) if eta is not None else -1
+    except (TypeError, ValueError):
+        eta_i = -1
+    if percent_f > 0.01 and elapsed_i > 0:
+        eta_i = int(max(0, round(elapsed_i * (1.0 - percent_f) / percent_f)))
+
+    try:
+        bytes_per_second = float(obj.get("bytes_per_second") or 0)
+    except (TypeError, ValueError):
+        bytes_per_second = 0.0
+    if bytes_per_second <= 0 and elapsed_i > 0 and bytes_done > 0:
+        bytes_per_second = bytes_done / elapsed_i
+
+    payload = backup_progress_payload(
+        phase="running",
+        percent=percent_f,
+        eta_seconds=eta_i,
+        seconds_elapsed=elapsed_i,
+        bytes_done=bytes_done,
+        total_bytes=total_bytes,
+        bytes_per_second=bytes_per_second,
+        files_done=files_done,
+        total_files=total_files,
+        error_count=int(obj.get("error_count") or 0),
+    )
+    return payload
+
+
+def reset_backup_progress_log() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with _backup_progress_lock:
+        BACKUP_PROGRESS_PATH.write_text("", encoding="utf-8")
+        try:
+            BACKUP_ACTIVE_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def persist_backup_event(payload: dict[str, Any]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(payload, separators=(",", ":"), default=str) + "\n"
+    tmp = BACKUP_ACTIVE_PATH.with_suffix(".json.tmp")
+    with _backup_progress_lock:
+        with BACKUP_PROGRESS_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+        tmp.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
+        tmp.replace(BACKUP_ACTIVE_PATH)
+
+
+def emit_backup_event(payload: dict[str, Any]) -> None:
+    out = dict(payload)
+    if _backup_progress_dest and not out.get("dest"):
+        out["dest"] = _backup_progress_dest
+    persist_backup_event(out)
+    emit_event(out)
+
+
+def read_active_backup_event() -> dict[str, Any] | None:
+    if not BACKUP_ACTIVE_PATH.is_file():
+        return None
+    try:
+        data = json.loads(BACKUP_ACTIVE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def running_backup_meta() -> dict[str, Any] | None:
+    meta = _read_lock_meta()
+    if not meta:
+        return None
+    try:
+        pid = int(meta.get("pid") or 0)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0 or pid == os.getpid():
+        return None
+    if not _pid_alive(pid) or not _looks_like_omackup(pid):
+        return None
+    role = str(meta.get("role") or "")
+    if role == WORK_ROLE_BACKUP or _looks_like_backup(pid):
+        return meta
+    return None
+
+
+def active_backup_status() -> dict[str, Any] | None:
+    running = running_backup_meta()
+    if not running:
+        return None
+    event = read_active_backup_event() or {}
+    payload = dict(event)
+    dest = str(payload.get("dest") or running.get("dest") or "")
+    if dest:
+        payload["dest"] = dest
+    try:
+        payload["pid"] = int(running.get("pid") or 0)
+    except (TypeError, ValueError):
+        payload["pid"] = 0
+    if not payload.get("event"):
+        payload["event"] = "progress"
+        payload["phase"] = str(payload.get("phase") or "running")
+        payload["ok"] = True
+    return payload
+
+
+def user_backup_service_text() -> str:
+    cli = plugin_cli_path()
+    return "\n".join(
+        [
+            "[Unit]",
+            "Description=Omackup backup (%i)",
+            "After=network-online.target",
+            "Wants=network-online.target",
+            "",
+            "[Service]",
+            "Type=oneshot",
+            "TimeoutStartSec=infinity",
+            f"ExecStart={cli} backup --dest %i",
+            "Nice=10",
+            "IOSchedulingClass=idle",
+            "",
+        ]
+    )
+
+
+def ensure_user_backup_service() -> None:
+    USER_SYSTEMD.mkdir(parents=True, exist_ok=True)
+    service = USER_SYSTEMD / "omackup@.service"
+    text = user_backup_service_text()
+    current = service.read_text(encoding="utf-8") if service.is_file() else ""
+    if current != text:
+        write_unit(service, text)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False, capture_output=True)
+
+
+def systemd_backup_unit(name: str) -> str:
+    return f"omackup@{safe_name(name)}.service"
+
+
+def start_systemd_backup(name: str) -> None:
+    if not shutil.which("systemctl"):
+        raise AppError("systemd is required to start a detached backup")
+    ensure_user_backup_service()
+    result = subprocess.run(
+        ["systemctl", "--user", "start", "--no-block", systemd_backup_unit(name)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise AppError((result.stderr or result.stdout or "Failed to start backup").strip())
+
+
+def stop_systemd_backup(name: str) -> bool:
+    if not name or not shutil.which("systemctl"):
+        return False
+    result = subprocess.run(
+        ["systemctl", "--user", "stop", "--no-block", systemd_backup_unit(name)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def read_new_progress_lines(offset: int) -> tuple[int, list[str]]:
+    if not BACKUP_PROGRESS_PATH.is_file():
+        return 0, []
+    with BACKUP_PROGRESS_PATH.open("rb") as fh:
+        size = fh.seek(0, os.SEEK_END)
+        if size < offset:
+            offset = 0
+        fh.seek(offset)
+        data = fh.read()
+    if not data:
+        return offset, []
+    split_at = data.rfind(b"\n")
+    if split_at < 0:
+        return offset, []
+    consumed = data[: split_at + 1]
+    lines = consumed.decode("utf-8", errors="replace").splitlines()
+    return offset + len(consumed), lines
+
+
+def emit_disconnected_progress(
+    *,
+    started: float,
+    percent: float,
+    bytes_done: int,
+    total_bytes: int,
+    files_done: int,
+    total_files: int,
+) -> None:
+    emit_backup_event(
+        backup_progress_payload(
+            phase="disconnected",
+            percent=percent,
+            eta_seconds=-1,
+            seconds_elapsed=int(max(0, time.time() - started)),
+            bytes_done=bytes_done,
+            total_bytes=total_bytes,
+            bytes_per_second=0.0,
+            files_done=files_done,
+            total_files=total_files,
+        )
+    )
+
+
+def cmd_backup_start(args: argparse.Namespace) -> int:
+    name = safe_name(args.dest)
+    find_dest(load_config(), name)
+    if not password_path(name).is_file():
+        raise AppError(f"No password set for {name}. Run: omackup key set --dest {name}")
+    running = running_backup_meta()
+    if running:
+        running_dest = safe_name(str(running.get("dest") or name))
+        if running_dest == name:
+            return emit({"ok": True, "dest": name, "already_running": True})
+        raise WorkLockHeldByBackup()
+    start_systemd_backup(name)
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        running = running_backup_meta()
+        if running and safe_name(str(running.get("dest") or "")) == name:
+            return emit({"ok": True, "dest": name, "started": True})
+        time.sleep(0.15)
+    return emit({"ok": True, "dest": name, "started": True})
+
+
+def cmd_backup_cancel(_args: argparse.Namespace) -> int:
+    running = running_backup_meta()
+    dest = ""
+    raw_dest = str((running or {}).get("dest") or "")
+    if raw_dest:
+        try:
+            dest = safe_name(raw_dest)
+        except AppError:
+            dest = ""
+    try:
+        pid = int((running or {}).get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+
+    stopped = False
+    if dest:
+        stopped = stop_systemd_backup(dest)
+    if pid and _pid_alive(pid) and (_looks_like_backup(pid) or _looks_like_omackup(pid)):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stopped = True
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        if running_backup_meta() is None:
+            break
+        time.sleep(0.2)
+
+    event = read_active_backup_event()
+    if not event or event.get("event") != "done":
+        persist_backup_event(
+            {
+                "ok": False,
+                "event": "done",
+                "error": "Backup cancelled",
+                "cancelled": True,
+                "dest": dest,
+            }
+        )
+    return emit({"ok": True, "stopped": stopped or running is not None, "dest": dest})
+
+
+def cmd_backup_follow(_args: argparse.Namespace) -> int:
+    current = active_backup_status()
+    was_running = current is not None
+    if current:
+        emit_event(current)
+    else:
+        emit_event({"ok": True, "event": "idle"})
+
+    offset = BACKUP_PROGRESS_PATH.stat().st_size if BACKUP_PROGRESS_PATH.is_file() else 0
+    inode = BACKUP_PROGRESS_PATH.stat().st_ino if BACKUP_PROGRESS_PATH.is_file() else None
+    while not _shutting_down:
+        try:
+            if BACKUP_PROGRESS_PATH.is_file():
+                st = BACKUP_PROGRESS_PATH.stat()
+                if inode is not None and (st.st_ino != inode or st.st_size < offset):
+                    offset = 0
+                inode = st.st_ino
+                offset, lines = read_new_progress_lines(offset)
+                for line in lines:
+                    payload = line.strip()
+                    if not payload.startswith("{"):
+                        continue
+                    try:
+                        obj = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    emit_event(obj)
+                    if obj.get("event") == "progress":
+                        was_running = True
+                    elif obj.get("event") == "done":
+                        was_running = False
+            else:
+                inode = None
+                offset = 0
+
+            running = running_backup_meta()
+            if running is not None:
+                was_running = True
+            elif was_running:
+                done = read_active_backup_event()
+                if done and done.get("event") == "done":
+                    emit_event(done)
+                else:
+                    emit_event({"ok": True, "event": "idle"})
+                was_running = False
+        except OSError:
+            pass
+        time.sleep(0.25)
+    return 0
+
+
+def wake_and_reachable(dest: dict[str, Any]) -> tuple[bool, str]:
+    try:
+        run_pre_command(dest)
+    except AppError:
+        pass
+    return dest_reachable(dest)
+
+
+def wait_until_reachable(
+    dest: dict[str, Any],
+    *,
+    started: float,
+    percent: float,
+    bytes_done: int,
+    total_bytes: int,
+    files_done: int,
+    total_files: int,
+) -> None:
+    emit_disconnected_progress(
+        started=started,
+        percent=percent,
+        bytes_done=bytes_done,
+        total_bytes=total_bytes,
+        files_done=files_done,
+        total_files=total_files,
+    )
+    while True:
+        time.sleep(2)
+        ok, _reason = wake_and_reachable(dest)
+        if ok:
+            return
+        emit_disconnected_progress(
+            started=started,
+            percent=percent,
+            bytes_done=bytes_done,
+            total_bytes=total_bytes,
+            files_done=files_done,
+            total_files=total_files,
+        )
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    global _backup_progress_dest
+    name = safe_name(args.dest)
+    cfg = load_config()
+    dest = prepare_dest(name)
+    started = time.time()
+    lock_fd: int | None = None
+    _backup_progress_dest = name
+    try:
+        if not password_path(name).is_file():
+            raise AppError(f"No password set for {name}. Run: omackup key set --dest {name}")
+        repo = str(dest.get("repository") or "")
+        if not repo:
+            raise AppError(f"Destination {name} has no repository")
+        lock_fd = acquire_exclusive_work_lock(WORK_ROLE_BACKUP, name, preempt_pending=True)
+        reset_backup_progress_log()
+
+        sources = [str(path) for path in source_paths(cfg)]
+        exclude = write_exclude_file(cfg)
+        restic_args = ["backup", "--json", "--one-file-system", "--exclude-file", str(exclude)]
+        if args.dry_run:
+            restic_args.append("--dry-run")
+        restic_args.extend(sources)
+
+        emit_backup_event(
+            backup_progress_payload(
+                phase="calculating",
+                percent=0.0,
+                eta_seconds=-1,
+                seconds_elapsed=0,
+                bytes_done=0,
+                total_bytes=0,
+                bytes_per_second=0.0,
+                files_done=0,
+                total_files=0,
+            )
+        )
+        measured = measure_selection(
+            cfg.get("sources", ["~"]),
+            cfg.get("exclude_paths", []),
+            cfg.get("excludes", []),
+        )
+        total_bytes = int(measured.get("bytes") or 0)
+        total_files = int(measured.get("files") or 0)
+        last_percent = 0.0
+        last_bytes_done = 0
+        last_files_done = 0
+
+        def snapshot_progress(payload: dict[str, Any]) -> None:
+            nonlocal last_percent, last_bytes_done, last_files_done
+            last_percent = float(payload.get("percent") or 0)
+            last_bytes_done = int(payload.get("bytes_done") or 0)
+            last_files_done = int(payload.get("files_done") or 0)
+
+        reachable, _reason = wake_and_reachable(dest)
+        if not reachable:
+            wait_until_reachable(
+                dest,
+                started=started,
+                percent=0.0,
+                bytes_done=0,
+                total_bytes=total_bytes,
+                files_done=0,
+                total_files=total_files,
+            )
+
+        summary: dict[str, Any] = {}
+        stderr_text = ""
+        while True:
+            dest = prepare_dest(name)
+            repo = str(dest.get("repository") or "")
+            cmd = [restic_bin(), *restic_rate_limit_args(dest), "-r", repo, *restic_args]
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=load_dest_env(name),
+                bufsize=1,
+            )
+            track_child(proc)
+            try:
+                assert proc.stdout is not None
+                assert proc.stderr is not None
+
+                lost_connection = threading.Event()
+                stderr_chunks: list[str] = []
+
+                def read_stderr() -> None:
+                    for chunk in proc.stderr:
+                        stderr_chunks.append(chunk)
+
+                def watch_connection() -> None:
+                    while proc.poll() is None:
+                        time.sleep(2)
+                        ok, _why = dest_reachable(dest)
+                        if ok:
+                            continue
+                        lost_connection.set()
+                        emit_disconnected_progress(
+                            started=started,
+                            percent=last_percent,
+                            bytes_done=last_bytes_done,
+                            total_bytes=total_bytes,
+                            files_done=last_files_done,
+                            total_files=total_files,
+                        )
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                        return
+
+                err_thread = threading.Thread(target=read_stderr, daemon=True)
+                watch_thread = threading.Thread(target=watch_connection, daemon=True)
+                err_thread.start()
+                watch_thread.start()
+
+                for raw in proc.stdout:
+                    if lost_connection.is_set():
+                        break
+                    line = raw.strip()
+                    if not line.startswith("{"):
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    message_type = obj.get("message_type")
+                    if message_type == "status":
+                        payload = progress_from_restic_status(
+                            obj,
+                            total_bytes=total_bytes,
+                            total_files=total_files,
+                            started_at=started,
+                        )
+                        snapshot_progress(payload)
+                        emit_backup_event(payload)
+                    elif message_type == "summary":
+                        summary = obj
+                    elif message_type == "error":
+                        emit_backup_event(
+                            {
+                                "ok": True,
+                                "event": "warning",
+                                "error": str(obj.get("error") or obj.get("message") or "restic error"),
+                            }
+                        )
+
+                code = proc.wait()
+                err_thread.join(timeout=2)
+                watch_thread.join(timeout=1)
+                stderr_text = "".join(stderr_chunks).strip()
+            finally:
+                untrack_child(proc)
+
+            if lost_connection.is_set() or (code != 0 and not dest_reachable(dest)[0]):
+                wait_until_reachable(
+                    dest,
+                    started=started,
+                    percent=last_percent,
+                    bytes_done=last_bytes_done,
+                    total_bytes=total_bytes,
+                    files_done=last_files_done,
+                    total_files=total_files,
+                )
+                continue
+
+            if code != 0:
+                raise AppError(stderr_text or "restic backup failed")
+            break
+
+        if not args.dry_run:
+            try:
+                retention = dest.get("retention") or DEFAULT_RETENTION
+                run_restic(
+                    name,
+                    [
+                        "forget",
+                        "--keep-daily",
+                        str(retention.get("daily", 7)),
+                        "--keep-weekly",
+                        str(retention.get("weekly", 4)),
+                        "--keep-monthly",
+                        str(retention.get("monthly", 12)),
+                        "--keep-yearly",
+                        str(retention.get("yearly", 3)),
+                        "--prune",
+                    ],
+                    rate_limit=True,
+                    tracked=True,
+                )
+            except AppError:
+                # A successful backup should still be recorded if prune fails.
+                pass
+            state = load_state(name)
+            state["last_success"] = int(time.time())
+            state["last_error"] = ""
+            state["last_duration_sec"] = int(time.time() - started)
+            if summary:
+                state["files_new"] = summary.get("files_new", 0)
+                state["data_added"] = summary.get("data_added", 0)
+            state["pending_files"] = 0
+            state["pending_new"] = 0
+            state["pending_changed"] = 0
+            state["pending_checked_at"] = int(time.time())
+            state["pending_since"] = 0
+            save_state(name, state)
+
+        emit_backup_event(
+            {
+                "ok": True,
+                "event": "done",
+                "dest": name,
+                "dry_run": bool(args.dry_run),
+                "summary": summary,
+                "duration_sec": int(time.time() - started),
+                "destination": dest_public(find_dest(load_config(), name)),
+            }
+        )
+        return 0
+    except WorkLockHeldByBackup as exc:
+        emit_backup_event({"ok": False, "event": "done", "error": str(exc), "dest": name})
+        return 1
+    except AppError as exc:
+        if not args.dry_run:
+            state = load_state(name)
+            state["last_failure"] = int(time.time())
+            state["last_error"] = str(exc)
+            state["last_duration_sec"] = int(time.time() - started)
+            save_state(name, state)
+        emit_backup_event({"ok": False, "event": "done", "error": str(exc), "dest": name})
+        return 1
+    except SystemExit:
+        emit_backup_event(
+            {
+                "ok": False,
+                "event": "done",
+                "error": "Backup cancelled",
+                "cancelled": True,
+                "dest": name,
+            }
+        )
+        raise
+    finally:
+        if lock_fd is not None:
+            release_work_lock(lock_fd)
+        _backup_progress_dest = ""
+
+
+def scan_pending_dest(cfg: dict[str, Any], dest: dict[str, Any]) -> dict[str, Any]:
+    name = safe_name(str(dest.get("name", "")))
+    public = dest_public(dest)
+    ok, reason = dest_reachable(dest)
+    if not ok:
+        return {
+            **{k: public[k] for k in ("name", "display_name", "kind")},
+            "ok": False,
+            "skipped": True,
+            "error": reason,
+            "files_new": int(public.get("pending_new") or 0),
+            "files_changed": int(public.get("pending_changed") or 0),
+            "files_pending": int(public.get("pending_files") or 0),
+            "pending_since": int(public.get("pending_since") or 0),
+            "checked_at": int(public.get("pending_checked_at") or 0),
+        }
+
+    sources = [str(path) for path in source_paths(cfg)]
+    exclude = write_exclude_file(cfg)
+    restic_args = [
+        "backup",
+        "--json",
+        "--one-file-system",
+        "--exclude-file",
+        str(exclude),
+        "--dry-run",
+        *sources,
+    ]
+    run_pre_command(dest)
+    repo = str(dest.get("repository") or "")
+    cmd = [restic_bin(), "-r", repo, *restic_args]
+    result = run_command_tracked(cmd, env=load_dest_env(name))
+    summary: dict[str, Any] = {}
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("message_type") == "summary":
+            summary = obj
+    if result.returncode != 0 and not summary:
+        err = (result.stderr or result.stdout or "pending scan failed").strip()
+        return {
+            **{k: public[k] for k in ("name", "display_name", "kind")},
+            "ok": False,
+            "skipped": False,
+            "error": err,
+            "files_new": int(public.get("pending_new") or 0),
+            "files_changed": int(public.get("pending_changed") or 0),
+            "files_pending": int(public.get("pending_files") or 0),
+            "pending_since": int(public.get("pending_since") or 0),
+            "checked_at": int(public.get("pending_checked_at") or 0),
+        }
+
+    files_new = int(summary.get("files_new") or 0)
+    files_changed = int(summary.get("files_changed") or 0)
+    files_pending = files_new + files_changed
+    checked_at = int(time.time())
+    state = load_state(name)
+    previous_pending = int(state.get("pending_files") or 0)
+    previous_since = int(state.get("pending_since") or 0)
+    state["pending_new"] = files_new
+    state["pending_changed"] = files_changed
+    state["pending_files"] = files_pending
+    state["pending_checked_at"] = checked_at
+    if files_pending <= 0:
+        state["pending_since"] = 0
+    elif previous_since > 0 and previous_pending > 0:
+        state["pending_since"] = previous_since
+    else:
+        state["pending_since"] = checked_at
+    save_state(name, state)
+    return {
+        "ok": True,
+        "skipped": False,
+        "name": name,
+        "display_name": public["display_name"],
+        "kind": public["kind"],
+        "files_new": files_new,
+        "files_changed": files_changed,
+        "files_pending": files_pending,
+        "pending_since": int(state.get("pending_since") or 0),
+        "data_added": int(summary.get("data_added") or 0),
+        "checked_at": checked_at,
+        "destination": dest_public(find_dest(load_config(), name)),
+    }
+
+
+def cmd_pending_changes(args: argparse.Namespace) -> int:
+    try:
+        with acquire_work_lock(WORK_ROLE_PENDING, str(args.dest or "")):
+            cfg = load_config()
+            if args.dest:
+                dests = [find_dest(cfg, args.dest)]
+            else:
+                dests = list(cfg.get("destinations") or [])
+            results = [scan_pending_dest(cfg, dest) for dest in dests]
+    except WorkLockBusy:
+        return emit(
+            {
+                "ok": True,
+                "skipped": True,
+                "reason": "busy",
+                "pending_files": 0,
+                "destinations": [],
+            }
+        )
+    pending_files = sum(int(item.get("files_pending") or 0) for item in results if item.get("ok"))
+    return emit(
+        {
+            "ok": True,
+            "pending_files": pending_files,
+            "destinations": results,
+        }
+    )
+
+
+def cmd_snapshots(args: argparse.Namespace) -> int:
+    name = safe_name(args.dest)
+    result = run_restic(name, ["snapshots", "--json"])
+    try:
+        snaps = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise AppError(f"Could not read snapshots: {exc}") from exc
+    items = []
+    for snap in snaps:
+        items.append(
+            {
+                "id": snap.get("short_id") or snap.get("id", "")[:8],
+                "full_id": snap.get("id"),
+                "time": snap.get("time"),
+                "hostname": snap.get("hostname"),
+                "paths": snap.get("paths") or [],
+                "tags": snap.get("tags") or [],
+            }
+        )
+    items.reverse()
+    return emit({"ok": True, "dest": name, "snapshots": items})
+
+
+def snapshot_roots(name: str, snapshot: str) -> list[str]:
+    result = run_restic(name, ["snapshots", "--json"])
+    try:
+        snaps = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    if snapshot != "latest":
+        for snap in snaps:
+            ident = str(snap.get("short_id") or "")
+            full = str(snap.get("id") or "")
+            if snapshot in (ident, full) or full.startswith(snapshot):
+                return [str(p) for p in (snap.get("paths") or [])]
+    if snaps:
+        return [str(p) for p in (snaps[-1].get("paths") or [])]
+    return []
+
+
+def cmd_ls(args: argparse.Namespace) -> int:
+    name = safe_name(args.dest)
+    snapshot = args.snapshot or "latest"
+    path = args.path or "/"
+    if path in ("", "/"):
+        roots = snapshot_roots(name, snapshot)
+        entries = [
+            {"name": Path(root).name or root, "path": root, "type": "dir", "size": 0, "mtime": ""}
+            for root in roots
+        ]
+        return emit({"ok": True, "dest": name, "snapshot": snapshot, "path": "/", "entries": entries})
+    result = run_restic(name, ["ls", "--json", snapshot, path])
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    prefix = path.rstrip("/")
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            node = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        node_path = str(node.get("path") or "")
+        if not node_path:
+            continue
+        if node_path.rstrip("/") == prefix:
+            continue
+        rel = node_path[len(prefix) :].lstrip("/") if prefix != "/" else node_path.lstrip("/")
+        if not rel or "/" in rel:
+            continue
+        if node_path in seen:
+            continue
+        seen.add(node_path)
+        entries.append(
+            {
+                "name": node.get("name") or rel,
+                "path": node_path,
+                "type": node.get("type") or "file",
+                "size": node.get("size") or 0,
+                "mtime": node.get("mtime") or "",
+            }
+        )
+    entries.sort(key=lambda item: (item["type"] != "dir", str(item["name"]).lower()))
+    return emit({"ok": True, "dest": name, "snapshot": snapshot, "path": path, "entries": entries})
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    name = safe_name(args.dest)
+    snapshot = args.snapshot or "latest"
+    target = expand_path(args.target) if args.target else RESTORE_ROOT
+    target.mkdir(parents=True, exist_ok=True)
+    restic_args = ["restore", snapshot, "--target", str(target)]
+    if args.path:
+        restic_args.extend(["--include", args.path])
+    run_restic(name, restic_args, rate_limit=True)
+    opened = str(target)
+    if args.path:
+        restored = target / args.path.lstrip("/")
+        if restored.exists():
+            opened = str(restored)
+    return emit({"ok": True, "dest": name, "snapshot": snapshot, "target": str(target), "opened": opened})
+
+
+def cmd_forget(args: argparse.Namespace) -> int:
+    name = safe_name(args.dest)
+    dest = find_dest(load_config(), name)
+    retention = dest.get("retention") or DEFAULT_RETENTION
+    run_restic(
+        name,
+        [
+            "forget",
+            "--keep-daily",
+            str(retention.get("daily", 7)),
+            "--keep-weekly",
+            str(retention.get("weekly", 4)),
+            "--keep-monthly",
+            str(retention.get("monthly", 12)),
+            "--keep-yearly",
+            str(retention.get("yearly", 3)),
+            "--prune",
+        ],
+        rate_limit=True,
+    )
+    return emit({"ok": True, "dest": name})
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    name = safe_name(args.dest)
+    result = run_restic(name, ["check"])
+    return emit({"ok": True, "dest": name, "output": (result.stdout or result.stderr).strip()})
+
+
+def list_mounts() -> list[dict[str, str]]:
+    """Find attached USB / removable drives that are currently mounted."""
+    user = os.environ.get("USER") or Path.home().name
+    media_roots = [Path("/run/media") / user, Path("/media") / user]
+    mounts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_mount(name: str, path: str, **extra: Any) -> None:
+        resolved = str(Path(path))
+        if not resolved or resolved in seen:
+            return
+        if resolved in {"/", "/boot", "/home", "/var", "/usr"}:
+            return
+        try:
+            if not Path(resolved).is_dir():
+                return
+        except OSError:
+            return
+        seen.add(resolved)
+        entry: dict[str, Any] = {
+            "name": name or Path(resolved).name or resolved,
+            "path": resolved,
+            "fstype": str(extra.get("fstype") or "unknown"),
+        }
+        for key in ("device", "size", "label", "model", "tran"):
+            value = extra.get(key)
+            if value:
+                entry[key] = str(value)
+        mounts.append(entry)
+
+    # Prefer lsblk: catches USB transport and removable disks reliably.
+    try:
+        result = subprocess.run(
+            [
+                "lsblk",
+                "-J",
+                "-o",
+                "NAME,PATH,SIZE,TYPE,MOUNTPOINT,FSTYPE,LABEL,MODEL,TRAN,RM,HOTPLUG",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            payload = json.loads(result.stdout)
+            disks = payload.get("blockdevices") or []
+
+            def walk(nodes: list[dict[str, Any]], parent: dict[str, Any] | None = None) -> None:
+                for node in nodes:
+                    kids = node.get("children") or []
+                    merged = dict(parent or {})
+                    for key in ("tran", "rm", "hotplug", "model"):
+                        if node.get(key) not in (None, "", False):
+                            merged[key] = node.get(key)
+                    is_usb = str(merged.get("tran") or "").lower() == "usb"
+                    is_removable = bool(node.get("rm") or merged.get("rm") or node.get("hotplug") or merged.get("hotplug"))
+                    mountpoint = node.get("mountpoint")
+                    if mountpoint and (is_usb or is_removable):
+                        label = node.get("label") or ""
+                        model = merged.get("model") or node.get("model") or ""
+                        name = label or model or Path(str(mountpoint)).name
+                        add_mount(
+                            str(name).strip() or Path(str(mountpoint)).name,
+                            str(mountpoint),
+                            fstype=node.get("fstype") or "unknown",
+                            device=node.get("path") or node.get("name") or "",
+                            size=node.get("size") or "",
+                            label=label,
+                            model=model,
+                            tran=merged.get("tran") or "",
+                        )
+                    if kids:
+                        walk(kids, merged)
+
+            walk(disks)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    # Supplement: mounted folders under the user's media directories.
+    try:
+        proc_mounts = Path("/proc/mounts").read_text(encoding="utf-8")
+    except OSError:
+        proc_mounts = ""
+    for line in proc_mounts.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mountpoint = parts[1].encode("utf-8").decode("unicode_escape")
+        fstype = parts[2]
+        if fstype in {"proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup2", "overlay", "squashfs"}:
+            continue
+        path = Path(mountpoint)
+        if not any(str(path).startswith(str(root) + "/") for root in media_roots):
+            continue
+        add_mount(path.name, str(path), fstype=fstype)
+
+    for root in media_roots:
+        if not root.is_dir():
+            continue
+        try:
+            children = sorted(root.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if not child.is_dir():
+                continue
+            try:
+                mounted = child.is_mount()
+            except OSError:
+                mounted = False
+            if mounted:
+                add_mount(child.name, str(child.resolve()), fstype="unknown")
+
+    mounts.sort(key=lambda item: str(item.get("name") or "").lower())
+    return mounts
+
+
+def cmd_mounts(_args: argparse.Namespace) -> int:
+    return emit({"ok": True, "mounts": list_mounts()})
+
+
+def cmd_dirs(args: argparse.Namespace) -> int:
+    path = expand_path(args.path or "~")
+    if not path.is_dir():
+        raise AppError(f"Not a directory: {path}")
+    entries: list[dict[str, Any]] = []
+    try:
+        children = sorted(
+            path.iterdir(),
+            key=lambda p: (p.name.startswith("."), not p.is_dir(), p.name.lower()),
+        )
+    except OSError as exc:
+        raise AppError(f"Cannot read {path}: {exc}") from exc
+    for child in children:
+        name = child.name
+        if name.startswith(".") and not args.all:
+            continue
+        try:
+            is_dir = child.is_dir()
+        except OSError:
+            continue
+        if args.dirs_only and not is_dir:
+            continue
+        entries.append(
+            {
+                "name": name,
+                "path": str(child),
+                "type": "dir" if is_dir else "file",
+            }
+        )
+    parent = str(path.parent) if path != path.parent else ""
+    return emit({"ok": True, "path": str(path), "parent": parent, "entries": entries})
+
+
+def cmd_pick_folder(_args: argparse.Namespace) -> int:
+    for command in (
+        ["zenity", "--file-selection", "--directory", "--title", "Choose folder to back up"],
+        ["kdialog", "--getexistingdirectory", str(Path.home())],
+    ):
+        if not shutil.which(command[0]):
+            continue
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            path = result.stdout.strip()
+            return emit({"ok": True, "path": path})
+        if result.returncode != 0:
+            return emit({"ok": False, "cancelled": True, "error": "Folder picker cancelled"}, 1)
+    raise AppError("No folder picker available. Type a path instead.")
+
+
+def write_unit(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def plugin_cli_path() -> Path:
+    installed = Path.home() / ".config" / "omarchy" / "plugins" / "gravey.omackup" / "bin" / "omackup"
+    if installed.is_file():
+        return installed
+    return Path(__file__).resolve()
+
+
+def install_schedules() -> list[str]:
+    cfg = load_config()
+    USER_SYSTEMD.mkdir(parents=True, exist_ok=True)
+    ensure_user_backup_service()
+    enabled: list[str] = []
+    for dest in cfg.get("destinations", []):
+        name = safe_name(str(dest.get("name", "")))
+        calendar = str(dest.get("schedule") or "").strip()
+        timer_path = USER_SYSTEMD / f"omackup-{name}.timer"
+        if not calendar:
+            if timer_path.exists():
+                subprocess.run(["systemctl", "--user", "disable", "--now", timer_path.name], check=False)
+                timer_path.unlink(missing_ok=True)
+            continue
+        write_unit(
+            timer_path,
+            "\n".join(
+                [
+                    "[Unit]",
+                    f"Description=Omackup schedule ({name})",
+                    "",
+                    "[Timer]",
+                    f"Unit=omackup@{name}.service",
+                    f"OnCalendar={calendar}",
+                    "Persistent=true",
+                    "",
+                    "[Install]",
+                    "WantedBy=timers.target",
+                    "",
+                ]
+            ),
+        )
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        result = subprocess.run(
+            ["systemctl", "--user", "enable", "--now", timer_path.name],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise AppError((result.stderr or result.stdout or "Failed to enable timer").strip())
+        enabled.append(name)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    return enabled
+
+
+def cmd_schedule_install(_args: argparse.Namespace) -> int:
+    return emit({"ok": True, "enabled": install_schedules()})
+
+
+def cmd_schedule_uninstall(_args: argparse.Namespace) -> int:
+    cfg = load_config()
+    names = [safe_name(str(dest.get("name", ""))) for dest in cfg.get("destinations", [])]
+    for name in names:
+        timer = f"omackup-{name}.timer"
+        subprocess.run(["systemctl", "--user", "disable", "--now", timer], check=False)
+        path = USER_SYSTEMD / timer
+        path.unlink(missing_ok=True)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    return emit({"ok": True, "removed": names, "launcher": uninstall_launcher()})
+
+
+def cmd_launcher_install(_args: argparse.Namespace) -> int:
+    return emit({"ok": True, "installed": ensure_launcher(force=True)})
+
+
+def cmd_launcher_uninstall(_args: argparse.Namespace) -> int:
+    return emit({"ok": True, "removed": uninstall_launcher()})
+
+
+def cmd_schedule_set(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    dest = find_dest(cfg, args.dest)
+    dest["schedule"] = "" if args.manual else (args.calendar or "")
+    save_config(cfg)
+    install_schedules()
+    return emit({"ok": True, "destination": dest_public(find_dest(load_config(), args.dest))})
+
+
+def cmd_open(args: argparse.Namespace) -> int:
+    target = expand_path(args.path)
+    if not target.exists():
+        raise AppError(f"Path does not exist: {target}")
+    opener = shutil.which("xdg-open") or shutil.which("nautilus")
+    if not opener:
+        raise AppError("No file manager found")
+    if opener.endswith("nautilus") and target.is_file():
+        subprocess.Popen(["nautilus", "--select", str(target)])
+    else:
+        subprocess.Popen([opener, str(target)])
+    return emit({"ok": True, "path": str(target)})
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="omackup", description="Incremental personal-file backups with restic")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("status", help="Overall status for the bar and panel")
+    sub.add_parser("destinations", help="List destinations")
+
+    dest_add = sub.add_parser("dest-add", help="Add or update a destination")
+    dest_add.add_argument("--name", required=True)
+    dest_add.add_argument("--kind", required=True, choices=["usb", "nas", "cloud"])
+    dest_add.add_argument("--repository", required=True)
+    dest_add.add_argument("--display-name", default="")
+    dest_add.add_argument("--schedule", default="")
+    dest_add.add_argument("--pre-command", default="")
+    dest_add.add_argument(
+        "--rate-limit-kibs",
+        type=int,
+        default=None,
+        help="Cap upload and download at this many KiB/s (0 disables)",
+    )
+    dest_add.add_argument("--password", default="")
+    dest_add.add_argument("--env", action="append", default=[])
+
+    dest_remove = sub.add_parser("dest-remove", help="Remove a destination")
+    dest_remove.add_argument("name")
+
+    dest_get = sub.add_parser("dest-get", help="Show one destination")
+    dest_get.add_argument("name")
+
+    sources = sub.add_parser("sources", help="List or change source folders")
+    sources.add_argument("action", nargs="?", default="list", choices=["list", "set", "add", "remove"])
+    sources.add_argument("paths", nargs="*")
+
+    exclude = sub.add_parser("exclude", help="List or change exclude patterns")
+    exclude.add_argument("action", nargs="?", default="list", choices=["list", "add", "remove", "replace", "reset", "defaults"])
+    exclude.add_argument("pattern", nargs="?")
+    exclude.add_argument("new_pattern", nargs="?")
+
+    selection = sub.add_parser("selection-set", help="Set included sources and excluded paths together")
+    selection.add_argument("--json", required=True)
+
+    selection_size = sub.add_parser("selection-size", help="Estimate total size of the current backup selection")
+    selection_size.add_argument("--json", default="", help="Optional selection override JSON")
+
+    key_set = sub.add_parser("key-set", help="Set or generate a destination password")
+    key_set.add_argument("--dest", required=True)
+    key_set.add_argument("--password", default="")
+
+    key_show = sub.add_parser("key-show", help="Show a destination password")
+    key_show.add_argument("--dest", required=True)
+
+    sub.add_parser("key-generate", help="Generate a password without saving it")
+
+    env_set = sub.add_parser("env-set", help="Set destination environment variables")
+    env_set.add_argument("--dest", required=True)
+    env_set.add_argument("pairs", nargs="+")
+
+    init = sub.add_parser("init", help="Initialize a restic repository")
+    init.add_argument("--dest", required=True)
+
+    backup = sub.add_parser("backup", help="Run a backup")
+    backup.add_argument("--dest", required=True)
+    backup.add_argument("--dry-run", action="store_true")
+
+    backup_start = sub.add_parser("backup-start", help="Start a backup as a systemd user service")
+    backup_start.add_argument("--dest", required=True)
+
+    sub.add_parser("backup-cancel", help="Stop the running backup")
+    sub.add_parser("backup-follow", help="Stream backup progress events")
+
+    pending = sub.add_parser("pending-changes", help="Scan for files that still need backing up")
+    pending.add_argument("--dest", default="")
+
+    snapshots = sub.add_parser("snapshots", help="List snapshots")
+    snapshots.add_argument("--dest", required=True)
+
+    listing = sub.add_parser("ls", help="List files in a snapshot")
+    listing.add_argument("--dest", required=True)
+    listing.add_argument("--snapshot", default="latest")
+    listing.add_argument("--path", default="/")
+
+    restore = sub.add_parser("restore", help="Restore files to ~/Restored")
+    restore.add_argument("--dest", required=True)
+    restore.add_argument("--snapshot", default="latest")
+    restore.add_argument("--path", default="")
+    restore.add_argument("--target", default="")
+
+    forget = sub.add_parser("forget", help="Apply retention and prune")
+    forget.add_argument("--dest", required=True)
+
+    check = sub.add_parser("check", help="Verify a repository")
+    check.add_argument("--dest", required=True)
+
+    sub.add_parser("mounts", help="List removable-drive mounts")
+
+    dirs_cmd = sub.add_parser("dirs", help="List a local directory")
+    dirs_cmd.add_argument("--path", default="~")
+    dirs_cmd.add_argument("--all", action="store_true")
+    dirs_cmd.add_argument("--dirs-only", action="store_true")
+
+    sub.add_parser("pick-folder", help="Open a graphical folder picker")
+
+    sub.add_parser("schedule-install", help="Install systemd user timers from config")
+    sub.add_parser("schedule-uninstall", help="Disable systemd user timers")
+    sub.add_parser("launcher-install", help="Add Omackup to the Super+Space launcher")
+    sub.add_parser("launcher-uninstall", help="Remove Omackup from the Super+Space launcher")
+
+    schedule_set = sub.add_parser("schedule-set", help="Change one destination schedule")
+    schedule_set.add_argument("--dest", required=True)
+    schedule_set.add_argument("--calendar", default="")
+    schedule_set.add_argument("--manual", action="store_true")
+
+    open_cmd = sub.add_parser("open", help="Open a restored path")
+    open_cmd.add_argument("path")
+    return parser
+
+
+COMMANDS = {
+    "status": cmd_status,
+    "destinations": cmd_destinations,
+    "dest-add": cmd_dest_add,
+    "dest-remove": cmd_dest_remove,
+    "dest-get": cmd_dest_get,
+    "sources": cmd_sources,
+    "exclude": cmd_exclude,
+    "selection-set": cmd_selection_set,
+    "selection-size": cmd_selection_size,
+    "key-set": cmd_key_set,
+    "key-show": cmd_key_show,
+    "key-generate": cmd_key_generate,
+    "env-set": cmd_env_set,
+    "init": cmd_init,
+    "backup": cmd_backup,
+    "backup-start": cmd_backup_start,
+    "backup-cancel": cmd_backup_cancel,
+    "backup-follow": cmd_backup_follow,
+    "pending-changes": cmd_pending_changes,
+    "snapshots": cmd_snapshots,
+    "ls": cmd_ls,
+    "restore": cmd_restore,
+    "forget": cmd_forget,
+    "check": cmd_check,
+    "mounts": cmd_mounts,
+    "dirs": cmd_dirs,
+    "pick-folder": cmd_pick_folder,
+    "schedule-install": cmd_schedule_install,
+    "schedule-uninstall": cmd_schedule_uninstall,
+    "launcher-install": cmd_launcher_install,
+    "launcher-uninstall": cmd_launcher_uninstall,
+    "schedule-set": cmd_schedule_set,
+    "open": cmd_open,
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        handler = COMMANDS[args.command]
+        return handler(args)
+    except AppError as exc:
+        return fail(str(exc), restic_installed=restic_installed())
+    except KeyboardInterrupt:
+        return fail("Cancelled")
+    except Exception as exc:
+        return fail(str(exc) or exc.__class__.__name__, restic_installed=restic_installed())
+
+
+if __name__ == "__main__":
+    sys.exit(main())

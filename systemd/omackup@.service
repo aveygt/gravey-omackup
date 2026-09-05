@@ -1,0 +1,11 @@
+[Unit]
+Description=Omackup backup (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+ExecStart=%h/.config/omarchy/plugins/gravey.omackup/bin/omackup backup --dest %i
+Nice=10
+IOSchedulingClass=idle
