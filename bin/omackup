@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,7 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from calendar import monthrange
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,23 @@ STATE_DIR = Path.home() / ".local" / "state" / "omackup"
 DATA_DIR = Path.home() / ".local" / "share" / "omackup"
 SECRETS_DIR = DATA_DIR / "secrets"
 RESTORE_ROOT = Path.home() / "Restored"
+CACHE_DIR = Path.home() / ".cache" / "omackup"
+PREVIEW_DIR = CACHE_DIR / "preview"
+PREVIEW_TEXT_LIMIT = 256 * 1024
+PREVIEW_IMAGE_LIMIT = 8 * 1024 * 1024
+PREVIEW_IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "ico"}
+PREVIEW_TEXT_EXTS = {
+    "txt", "md", "markdown", "rst", "org", "log", "csv", "tsv",
+    "json", "jsonc", "jsonl", "toml", "yaml", "yml", "ini", "cfg", "conf", "env",
+    "xml", "html", "htm", "css", "scss", "less",
+    "js", "jsx", "ts", "tsx", "mjs", "cjs",
+    "py", "rb", "rs", "go", "java", "kt", "kts", "swift",
+    "c", "cc", "cpp", "h", "hh", "hpp", "m", "mm",
+    "sh", "bash", "zsh", "fish", "ps1",
+    "qml", "js", "sql", "graphql",
+    "desktop", "service", "timer", "socket",
+    "gitignore", "dockerignore", "editorconfig", "gitconfig",
+}
 SERVICE_TEMPLATE = PLUGIN_DIR / "systemd" / "omackup@.service"
 USER_SYSTEMD = Path.home() / ".config" / "systemd" / "user"
 LAUNCHER_DESKTOP_ID = "gravey.omackup"
@@ -59,6 +78,11 @@ DEFAULT_RETENTION = {
 
 # restic --limit-upload/--limit-download are KiB/s. 0 means unlimited.
 RATE_LIMIT_MAX_KIBS = 97_656_250
+
+SCHEDULE_KINDS = ("interval", "daily", "weekly", "monthly")
+WEEKDAY_SYSTEMD = ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
+WEEKDAY_LABELS = ("S", "M", "T", "W", "T", "F", "S")
+SCHEDULE_RESULT_PATH = STATE_DIR / "schedule.result.json"
 
 DEFAULT_EXCLUDES = [
     ".cache",
@@ -785,6 +809,105 @@ def run_restic(
     return result
 
 
+def run_restic_bytes(
+    name: str,
+    args: list[str],
+    timeout: float | None = 60,
+) -> bytes:
+    dest = prepare_dest(name)
+    run_pre_command(dest)
+    if not password_path(name).is_file():
+        raise AppError(f"No password set for {name}. Run: omackup key set --dest {name}")
+    repo = str(dest.get("repository") or "")
+    if not repo:
+        raise AppError(f"Destination {name} has no repository")
+    cmd = [restic_bin(), "-r", repo, *args]
+    env = load_dest_env(name)
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AppError("Timed out reading the file preview.") from exc
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or b"restic failed").decode("utf-8", errors="replace").strip()
+        raise AppError(restic_cloud_error(err))
+    return result.stdout
+
+
+def prune_preview_cache(keep: int = 8) -> None:
+    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    files = [path for path in PREVIEW_DIR.iterdir() if path.is_file()]
+    files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    for old in files[keep:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def preview_extension(path: str) -> str:
+    name = Path(path).name.lower()
+    if name.startswith(".") and name.count(".") == 1:
+        return name[1:]
+    suffix = Path(name).suffix.lower().lstrip(".")
+    return suffix
+
+
+def image_kind_from_bytes(data: bytes) -> str | None:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return "gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if data.startswith(b"BM"):
+        return "bmp"
+    head = data.lstrip()[:256].lower()
+    if head.startswith(b"<svg") or (head.startswith(b"<?xml") and b"<svg" in head):
+        return "svg"
+    return None
+
+
+def looks_like_text(data: bytes) -> bool:
+    if not data:
+        return True
+    sample = data[:8192]
+    if b"\x00" in sample:
+        return False
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def ls_node(name: str, snapshot: str, path: str) -> dict[str, Any] | None:
+    result = run_restic(name, ["ls", "--json", snapshot, path], check=False)
+    if result.returncode != 0:
+        return None
+    wanted = path.rstrip("/") or path
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            node = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        node_path = str(node.get("path") or "").rstrip("/")
+        if node_path == wanted or str(node.get("path") or "") == path:
+            return node
+    return None
+
+
 def write_exclude_file(cfg: dict[str, Any]) -> Path:
     path = DATA_DIR / "excludes.txt"
     lines = [str(item) for item in cfg.get("excludes", []) if str(item).strip()]
@@ -864,9 +987,11 @@ def dest_reachable(dest: dict[str, Any]) -> tuple[bool, str]:
 
     if kind == "usb" or not repo.startswith(("sftp:", "s3:", "b2:", "rest:", "rclone:")):
         path = Path(repo)
-        if path.exists() or path.parent.exists():
+        if (path / "config").is_file():
             return True, ""
-        return False, "Backup drive is not mounted"
+        if path.is_dir() and not load_state(name).get("last_success"):
+            return True, ""
+        return False, "Unmounted"
 
     if kind == "nas" or repo.startswith("sftp:"):
         endpoint = sftp_endpoint(repo)
@@ -891,17 +1016,380 @@ def dest_reachable(dest: dict[str, Any]) -> tuple[bool, str]:
     return True, ""
 
 
+def default_schedule_spec(enabled: bool = False, kind: str = "daily") -> dict[str, Any]:
+    return {
+        "enabled": bool(enabled),
+        "kind": kind if kind in SCHEDULE_KINDS else "daily",
+        "minutes": 60,
+        "times": [],
+        "times_text": "300",
+        "weekdays": [True, False, False, False, False, False, False],
+        "monthday": 1,
+    }
+
+
+def format_user_time(hour: int, minute: int) -> str:
+    if hour < 10:
+        return f"{hour}{minute:02d}"
+    return f"{hour:02d}{minute:02d}"
+
+
+def format_clock(hour: int, minute: int) -> str:
+    return f"{hour:02d}:{minute:02d}"
+
+
+def parse_clock_token(token: str) -> tuple[int, int] | None:
+    text = str(token or "").strip().lower().replace(" ", "")
+    if not text:
+        return None
+    if ":" in text:
+        parts = text.split(":")
+        if len(parts) != 2:
+            return None
+        try:
+            hour = int(parts[0], 10)
+            minute = int(parts[1], 10)
+        except ValueError:
+            return None
+    else:
+        if not text.isdigit():
+            return None
+        if len(text) <= 2:
+            hour = int(text, 10)
+            minute = 0
+        elif len(text) == 3:
+            hour = int(text[0], 10)
+            minute = int(text[1:], 10)
+        elif len(text) == 4:
+            hour = int(text[:2], 10)
+            minute = int(text[2:], 10)
+        else:
+            return None
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+    return hour, minute
+
+
+def parse_times_text(text: str) -> list[tuple[int, int]]:
+    seen: set[tuple[int, int]] = set()
+    out: list[tuple[int, int]] = []
+    for part in str(text or "").split(","):
+        parsed = parse_clock_token(part)
+        if parsed is None:
+            continue
+        if parsed in seen:
+            continue
+        seen.add(parsed)
+        out.append(parsed)
+    out.sort()
+    return out
+
+
+def times_from_spec(spec: dict[str, Any]) -> list[tuple[int, int]]:
+    text = str(spec.get("times_text") or "").strip()
+    if text:
+        parsed = parse_times_text(text)
+        if parsed:
+            return parsed
+    raw_times = spec.get("times")
+    if isinstance(raw_times, list) and raw_times:
+        parsed: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for item in raw_times:
+            token = parse_clock_token(str(item))
+            if token is None or token in seen:
+                continue
+            seen.add(token)
+            parsed.append(token)
+        if parsed:
+            parsed.sort()
+            return parsed
+    return []
+
+
+def weekdays_from_spec(spec: dict[str, Any]) -> list[bool]:
+    raw = spec.get("weekdays")
+    days = [False] * 7
+    if isinstance(raw, list) and raw:
+        if all(isinstance(item, bool) or item in (0, 1) for item in raw) and len(raw) == 7:
+            return [bool(item) for item in raw]
+        for item in raw:
+            try:
+                index = int(item)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index <= 6:
+                days[index] = True
+        if any(days):
+            return days
+    return [True, False, False, False, False, False, False]
+
+
+def migrate_calendar(text: str) -> dict[str, Any]:
+    spec = default_schedule_spec(True, "daily")
+    matches = re.findall(r"(\d{1,2}):(\d{2})(?::\d{2})?", text)
+    clocks: list[tuple[int, int]] = []
+    for hour_s, minute_s in matches:
+        hour, minute = int(hour_s), int(minute_s)
+        if 0 <= hour <= 23 and 0 <= minute <= 59 and (hour, minute) not in clocks:
+            clocks.append((hour, minute))
+    if clocks:
+        spec["times"] = [format_clock(h, m) for h, m in clocks]
+        spec["times_text"] = ",".join(format_user_time(h, m) for h, m in clocks)
+    if "Mon..Fri" in text or "Mon-Fri" in text:
+        spec["kind"] = "weekly"
+        spec["weekdays"] = [False, True, True, True, True, True, False]
+    return spec
+
+
+def normalize_schedule(raw: Any) -> dict[str, Any]:
+    spec = default_schedule_spec(False)
+    if isinstance(raw, dict):
+        data = raw
+    else:
+        data = {}
+    kind = str(data.get("kind") or spec["kind"]).strip().lower()
+    if kind not in SCHEDULE_KINDS:
+        kind = "daily"
+    spec["kind"] = kind
+    spec["enabled"] = bool(data.get("enabled"))
+    try:
+        minutes = int(data.get("minutes") or spec["minutes"])
+    except (TypeError, ValueError):
+        minutes = 60
+    spec["minutes"] = max(1, min(10080, minutes))
+    try:
+        monthday = int(data.get("monthday") or spec["monthday"])
+    except (TypeError, ValueError):
+        monthday = 1
+    spec["monthday"] = max(1, min(31, monthday))
+    spec["weekdays"] = weekdays_from_spec(data)
+    spec["times_text"] = str(data.get("times_text") or "").strip() or spec["times_text"]
+    clocks = times_from_spec({**spec, **data, "times_text": spec["times_text"]})
+    if clocks:
+        spec["times"] = [format_clock(h, m) for h, m in clocks]
+        if not str(data.get("times_text") or "").strip():
+            spec["times_text"] = ",".join(format_user_time(h, m) for h, m in clocks)
+    return spec
+
+
+def parse_schedule(value: Any) -> dict[str, Any]:
+    if value in (None, "", False):
+        return default_schedule_spec(False)
+    if isinstance(value, dict):
+        spec = normalize_schedule(value)
+        if spec["enabled"] or spec.get("kind"):
+            if value.get("enabled") is False:
+                spec["enabled"] = False
+        return spec
+    text = str(value).strip()
+    if not text:
+        return default_schedule_spec(False)
+    if text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise AppError(f"Invalid schedule: {exc}") from exc
+        if isinstance(parsed, dict):
+            return normalize_schedule(parsed)
+        raise AppError("Invalid schedule")
+    return migrate_calendar(text)
+
+
+def schedule_enabled(spec: Any) -> bool:
+    parsed = parse_schedule(spec) if not isinstance(spec, dict) else normalize_schedule(spec)
+    return bool(parsed.get("enabled"))
+
+
+def schedule_error(spec: dict[str, Any]) -> str:
+    parsed = normalize_schedule(spec)
+    if not parsed.get("enabled"):
+        return ""
+    kind = parsed["kind"]
+    if kind == "interval":
+        if parsed["minutes"] < 1:
+            return "Interval must be at least 1 minute"
+        return ""
+    if kind == "daily":
+        if not times_from_spec(parsed):
+            return "Add at least one time, like 300 or 1430"
+        return ""
+    if kind == "weekly":
+        if not any(weekdays_from_spec(parsed)):
+            return "Choose at least one day of the week"
+        if not times_from_spec(parsed):
+            return "Add at least one time, like 300 or 1430"
+        return ""
+    if kind == "monthly":
+        if parsed["monthday"] < 1 or parsed["monthday"] > 31:
+            return "Day of the month must be 1-31"
+        return ""
+    return "Unknown schedule type"
+
+
+def schedule_label(spec: Any) -> str:
+    parsed = parse_schedule(spec)
+    if not parsed.get("enabled"):
+        return "Manual only"
+    kind = parsed["kind"]
+    clocks = times_from_spec(parsed)
+    clock_text = ", ".join(format_clock(h, m) for h, m in clocks) if clocks else "03:00"
+    if kind == "interval":
+        mins = parsed["minutes"]
+        return f"Every {mins} minute" if mins == 1 else f"Every {mins} minutes"
+    if kind == "daily":
+        return f"Daily at {clock_text}"
+    if kind == "weekly":
+        days = weekdays_from_spec(parsed)
+        names = [WEEKDAY_SYSTEMD[i] for i, on in enumerate(days) if on]
+        day_text = ", ".join(names) if names else "no days"
+        return f"{day_text} at {clock_text}"
+    day = parsed["monthday"]
+    suffix = "th" if 10 <= day % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    extra = " (or last day)" if day > 28 else ""
+    return f"Monthly on the {day}{suffix}{extra} at 03:00"
+
+
+def monthly_due_on(monthday: int, when: datetime | None = None) -> bool:
+    now = when or datetime.now()
+    last = monthrange(now.year, now.month)[1]
+    target = monthday if monthday <= last else last
+    return now.day == target
+
+
+def scheduled_due_now(spec: dict[str, Any], when: datetime | None = None) -> bool:
+    parsed = normalize_schedule(spec)
+    if not parsed.get("enabled"):
+        return False
+    if parsed["kind"] != "monthly":
+        return True
+    return monthly_due_on(int(parsed["monthday"]), when)
+
+
+def schedule_overdue(spec: dict[str, Any], last_success: int, pending: bool) -> bool:
+    if not schedule_enabled(spec):
+        return False
+    if pending:
+        return True
+    if not last_success:
+        return True
+    age = time.time() - last_success
+    parsed = normalize_schedule(spec)
+    kind = parsed["kind"]
+    if kind == "interval":
+        return age > max(int(parsed["minutes"]) * 120, 3600)
+    if kind == "weekly":
+        return age > 10 * 86400
+    if kind == "monthly":
+        return age > 40 * 86400
+    return age > 36 * 3600
+
+
+def timer_calendars(spec: dict[str, Any]) -> list[str]:
+    parsed = normalize_schedule(spec)
+    kind = parsed["kind"]
+    clocks = times_from_spec(parsed) or [(3, 0)]
+    if kind == "daily":
+        return [f"*-*-* {format_clock(h, m)}:00" for h, m in clocks]
+    if kind == "weekly":
+        days = [WEEKDAY_SYSTEMD[i] for i, on in enumerate(weekdays_from_spec(parsed)) if on]
+        if not days:
+            return []
+        prefix = ",".join(days)
+        return [f"{prefix} *-*-* {format_clock(h, m)}:00" for h, m in clocks]
+    if kind == "monthly":
+        day = int(parsed["monthday"])
+        days = [day] if day <= 28 else [28, 29, 30, 31]
+        return [f"*-*-{d} 03:00:00" for d in days]
+    return []
+
+
+def write_schedule_result(name: str, **extra: Any) -> None:
+    payload = {"dest": name, "ts": int(time.time()), **extra}
+    SCHEDULE_RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SCHEDULE_RESULT_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    tmp.replace(SCHEDULE_RESULT_PATH)
+
+
+def read_schedule_result(name: str, since: float) -> dict[str, Any] | None:
+    if not SCHEDULE_RESULT_PATH.is_file():
+        return None
+    try:
+        data = json.loads(SCHEDULE_RESULT_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if safe_name(str(data.get("dest") or "")) != safe_name(name):
+        return None
+    if int(data.get("ts") or 0) < int(since) - 1:
+        return None
+    return data
+
+
+def desktop_notify(title: str, body: str) -> None:
+    if not shutil.which("notify-send"):
+        return
+    subprocess.Popen(
+        ["notify-send", "-a", "Omackup", "-u", "normal", title, body],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def mark_schedule_pending(dest: dict[str, Any], *, notify: bool) -> None:
+    name = safe_name(str(dest.get("name", "")))
+    state = load_state(name)
+    already = bool(state.get("schedule_pending"))
+    state["schedule_pending"] = True
+    if not already:
+        state["schedule_pending_at"] = int(time.time())
+    if notify and not state.get("schedule_pending_notified"):
+        if shutil.which("notify-send"):
+            label = str(dest.get("display_name") or name)
+            desktop_notify(
+                "Backup pending",
+                label + " is not connected. Backup will start when it is.",
+            )
+            state["schedule_pending_notified"] = True
+    save_state(name, state)
+    write_schedule_result(name, skipped=True, pending=True, reason="unreachable")
+
+
+def clear_schedule_pending(name: str) -> None:
+    state = load_state(name)
+    if not state.get("schedule_pending") and not state.get("schedule_pending_notified"):
+        return
+    state["schedule_pending"] = False
+    state["schedule_pending_notified"] = False
+    save_state(name, state)
+
+
+def dest_has_changes(cfg: dict[str, Any], dest: dict[str, Any]) -> bool:
+    name = safe_name(str(dest.get("name", "")))
+    state = load_state(name)
+    pending = int(state.get("pending_files") or 0)
+    checked = int(state.get("pending_checked_at") or 0)
+    if pending > 0:
+        return True
+    if state.get("schedule_pending"):
+        return True
+    if checked and time.time() - checked < 20 * 60:
+        return False
+    result = scan_pending_dest(cfg, dest)
+    return int(result.get("files_pending") or 0) > 0
+
+
 def dest_public(dest: dict[str, Any]) -> dict[str, Any]:
     name = safe_name(str(dest.get("name", "")))
     state = load_state(name)
-    schedule = str(dest.get("schedule") or "")
+    spec = parse_schedule(dest.get("schedule"))
     last_success = int(state.get("last_success") or 0)
     last_failure = int(state.get("last_failure") or 0)
-    overdue = False
-    if schedule and last_success:
-        overdue = (time.time() - last_success) > (36 * 3600)
-    elif schedule and not last_success:
-        overdue = True
+    schedule_pending = bool(state.get("schedule_pending")) and schedule_enabled(spec)
+    overdue = schedule_overdue(spec, last_success, schedule_pending)
     failed = last_failure > last_success
     initialized = bool(state.get("initialized"))
     repo = str(dest.get("repository") or "")
@@ -915,7 +1403,10 @@ def dest_public(dest: dict[str, Any]) -> dict[str, Any]:
         "display_name": str(dest.get("display_name") or name),
         "kind": str(dest.get("kind") or "usb"),
         "repository": repo,
-        "schedule": schedule,
+        "schedule": spec,
+        "schedule_label": schedule_label(spec),
+        "schedule_pending": schedule_pending,
+        "schedule_pending_notified": bool(state.get("schedule_pending_notified")) and schedule_pending,
         "pre_command": str(dest.get("pre_command") or ""),
         "rate_limit_kibs": normalize_rate_limit_kibs(dest.get("rate_limit_kibs") or 0),
         "retention": dest.get("retention") or dict(DEFAULT_RETENTION),
@@ -1132,21 +1623,33 @@ def cmd_dest_add(args: argparse.Namespace) -> int:
     name = safe_name(args.name)
     kind = args.kind
     repo = args.repository.strip()
+    updating = any(safe_name(str(item.get("name", ""))) == name for item in cfg.get("destinations") or [])
     if kind == "usb":
         path = expand_path(repo)
-        path.mkdir(parents=True, exist_ok=True)
-        repo = str(path)
+        parent_ok = path.exists() or path.parent.exists()
+        if parent_ok:
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                if not updating:
+                    raise AppError(f"Cannot write to USB destination: {exc}") from exc
+            repo = str(path)
+        elif not updating:
+            raise AppError("USB drive is not mounted")
     dest = {
         "name": name,
         "display_name": args.display_name or name,
         "kind": kind,
         "repository": repo,
-        "schedule": args.schedule or "",
+        "schedule": parse_schedule(args.schedule),
         "pre_command": args.pre_command or "",
         "retention": dict(DEFAULT_RETENTION),
     }
     if args.rate_limit_kibs is not None:
         dest["rate_limit_kibs"] = normalize_rate_limit_kibs(args.rate_limit_kibs)
+    err = schedule_error(dest["schedule"])
+    if err:
+        raise AppError(err)
     upsert_dest(cfg, dest)
     if args.password:
         write_secret_file(password_path(name), args.password.strip() + "\n")
@@ -1676,6 +2179,32 @@ def backup_percent(bytes_done: int, total_bytes: int, files_done: int, total_fil
     return 0.0
 
 
+class BackupRateWindow:
+    """Recent bytes_done samples so the displayed rate can follow current speed."""
+
+    def __init__(self, window_sec: float = 20.0) -> None:
+        self.window_sec = window_sec
+        self._samples: list[tuple[float, int]] = []
+
+    def reset(self) -> None:
+        self._samples.clear()
+
+    def rate(self, now: float, bytes_done: int) -> float:
+        done = max(0, int(bytes_done))
+        if self._samples and done < self._samples[-1][1]:
+            self._samples.clear()
+        self._samples.append((now, done))
+        cutoff = now - self.window_sec
+        while len(self._samples) > 2 and self._samples[0][0] < cutoff:
+            self._samples.pop(0)
+        first_t, first_b = self._samples[0]
+        last_t, last_b = self._samples[-1]
+        dt = last_t - first_t
+        if dt < 0.5:
+            return 0.0
+        return max(0.0, (last_b - first_b) / dt)
+
+
 def backup_progress_payload(
     *,
     phase: str,
@@ -1711,10 +2240,22 @@ def progress_from_restic_status(
     total_bytes: int,
     total_files: int,
     started_at: float,
+    rate_window: BackupRateWindow | None = None,
 ) -> dict[str, Any]:
     bytes_done = int(obj.get("bytes_done") or 0)
     files_done = int(obj.get("files_done") or 0)
-    percent_f = backup_percent(bytes_done, total_bytes, files_done, total_files)
+    try:
+        restic_bytes = int(obj.get("total_bytes") or 0)
+    except (TypeError, ValueError):
+        restic_bytes = 0
+    try:
+        restic_files = int(obj.get("total_files") or 0)
+    except (TypeError, ValueError):
+        restic_files = 0
+    use_bytes = max(total_bytes, restic_bytes)
+    use_files = max(total_files, restic_files)
+    percent_f = backup_percent(bytes_done, use_bytes, files_done, use_files)
+    phase = "running" if use_bytes > 0 or use_files > 0 or bytes_done > 0 else "calculating"
 
     elapsed = obj.get("seconds_elapsed")
     try:
@@ -1729,26 +2270,29 @@ def progress_from_restic_status(
         eta_i = int(eta) if eta is not None else -1
     except (TypeError, ValueError):
         eta_i = -1
-    if percent_f > 0.01 and elapsed_i > 0:
-        eta_i = int(max(0, round(elapsed_i * (1.0 - percent_f) / percent_f)))
 
     try:
         bytes_per_second = float(obj.get("bytes_per_second") or 0)
     except (TypeError, ValueError):
         bytes_per_second = 0.0
-    if bytes_per_second <= 0 and elapsed_i > 0 and bytes_done > 0:
-        bytes_per_second = bytes_done / elapsed_i
+    window_rate = rate_window.rate(time.time(), bytes_done) if rate_window else 0.0
+    if bytes_per_second <= 0:
+        remaining = max(0, use_bytes - bytes_done)
+        if eta_i > 0 and remaining > 0:
+            bytes_per_second = remaining / eta_i
+        else:
+            bytes_per_second = window_rate
 
     payload = backup_progress_payload(
-        phase="running",
+        phase=phase,
         percent=percent_f,
         eta_seconds=eta_i,
         seconds_elapsed=elapsed_i,
         bytes_done=bytes_done,
-        total_bytes=total_bytes,
+        total_bytes=use_bytes,
         bytes_per_second=bytes_per_second,
         files_done=files_done,
-        total_files=total_files,
+        total_files=use_files,
         error_count=int(obj.get("error_count") or 0),
     )
     return payload
@@ -1832,19 +2376,21 @@ def active_backup_status() -> dict[str, Any] | None:
     return payload
 
 
-def user_backup_service_text() -> str:
+def user_backup_service_text(scheduled: bool = False) -> str:
     cli = plugin_cli_path()
+    extra = " --scheduled" if scheduled else ""
+    title = "Omackup scheduled backup (%i)" if scheduled else "Omackup backup (%i)"
     return "\n".join(
         [
             "[Unit]",
-            "Description=Omackup backup (%i)",
+            f"Description={title}",
             "After=network-online.target",
             "Wants=network-online.target",
             "",
             "[Service]",
             "Type=oneshot",
             "TimeoutStartSec=infinity",
-            f"ExecStart={cli} backup --dest %i",
+            f"ExecStart={cli} backup --dest %i{extra}",
             "Nice=10",
             "IOSchedulingClass=idle",
             "",
@@ -1854,24 +2400,53 @@ def user_backup_service_text() -> str:
 
 def ensure_user_backup_service() -> None:
     USER_SYSTEMD.mkdir(parents=True, exist_ok=True)
-    service = USER_SYSTEMD / "omackup@.service"
-    text = user_backup_service_text()
-    current = service.read_text(encoding="utf-8") if service.is_file() else ""
-    if current != text:
-        write_unit(service, text)
+    units = (
+        ("omackup@.service", user_backup_service_text(False)),
+        ("omackup-scheduled@.service", user_backup_service_text(True)),
+    )
+    changed = False
+    for filename, text in units:
+        service = USER_SYSTEMD / filename
+        current = service.read_text(encoding="utf-8") if service.is_file() else ""
+        if current != text:
+            write_unit(service, text)
+            changed = True
+    if changed:
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=False, capture_output=True)
 
 
-def systemd_backup_unit(name: str) -> str:
-    return f"omackup@{safe_name(name)}.service"
+def systemd_backup_unit(name: str, scheduled: bool = False) -> str:
+    prefix = "omackup-scheduled" if scheduled else "omackup"
+    return f"{prefix}@{safe_name(name)}.service"
 
 
-def start_systemd_backup(name: str) -> None:
+def systemd_unit_state(unit: str) -> str:
+    if not shutil.which("systemctl"):
+        return "unknown"
+    result = subprocess.run(
+        ["systemctl", "--user", "is-active", unit],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return (result.stdout or "").strip() or "unknown"
+
+
+def backup_service_busy(name: str) -> bool:
+    if running_backup_meta():
+        return True
+    for scheduled in (False, True):
+        if systemd_unit_state(systemd_backup_unit(name, scheduled)) in ("active", "activating"):
+            return True
+    return False
+
+
+def start_systemd_backup(name: str, scheduled: bool = False) -> None:
     if not shutil.which("systemctl"):
         raise AppError("systemd is required to start a detached backup")
     ensure_user_backup_service()
     result = subprocess.run(
-        ["systemctl", "--user", "start", "--no-block", systemd_backup_unit(name)],
+        ["systemctl", "--user", "start", "--no-block", systemd_backup_unit(name, scheduled)],
         check=False,
         capture_output=True,
         text=True,
@@ -1938,6 +2513,7 @@ def emit_disconnected_progress(
 def cmd_backup_start(args: argparse.Namespace) -> int:
     name = safe_name(args.dest)
     find_dest(load_config(), name)
+    scheduled = bool(getattr(args, "scheduled", False))
     if not password_path(name).is_file():
         raise AppError(f"No password set for {name}. Run: omackup key set --dest {name}")
     running = running_backup_meta()
@@ -1946,14 +2522,65 @@ def cmd_backup_start(args: argparse.Namespace) -> int:
         if running_dest == name:
             return emit({"ok": True, "dest": name, "already_running": True})
         raise WorkLockHeldByBackup()
-    start_systemd_backup(name)
-    deadline = time.time() + 8
+    if backup_service_busy(name):
+        return emit({"ok": True, "dest": name, "already_running": True})
+    started_at = time.time()
+    start_systemd_backup(name, scheduled)
+    unit = systemd_backup_unit(name, scheduled)
+    deadline = time.time() + 45
+    saw_unit = False
     while time.time() < deadline:
         running = running_backup_meta()
         if running and safe_name(str(running.get("dest") or "")) == name:
             return emit({"ok": True, "dest": name, "started": True})
+        state = systemd_unit_state(unit)
+        if state in ("active", "activating"):
+            saw_unit = True
+        if scheduled:
+            result = read_schedule_result(name, started_at)
+            if result and result.get("skipped"):
+                return emit(
+                    {
+                        "ok": True,
+                        "dest": name,
+                        "skipped": True,
+                        "pending": bool(result.get("pending")),
+                        "reason": str(result.get("reason") or "skipped"),
+                    }
+                )
+        if state == "failed":
+            raise AppError("Backup failed to start")
+        if saw_unit and state in ("inactive", "dead"):
+            result = read_schedule_result(name, started_at) if scheduled else None
+            if result and result.get("skipped"):
+                return emit(
+                    {
+                        "ok": True,
+                        "dest": name,
+                        "skipped": True,
+                        "pending": bool(result.get("pending")),
+                        "reason": str(result.get("reason") or "skipped"),
+                    }
+                )
+            if running_backup_meta():
+                return emit({"ok": True, "dest": name, "started": True})
+            return emit({"ok": True, "dest": name, "started": True})
         time.sleep(0.15)
-    return emit({"ok": True, "dest": name, "started": True})
+    if backup_service_busy(name):
+        return emit({"ok": True, "dest": name, "started": True})
+    if scheduled:
+        result = read_schedule_result(name, started_at)
+        if result and result.get("skipped"):
+            return emit(
+                {
+                    "ok": True,
+                    "dest": name,
+                    "skipped": True,
+                    "pending": bool(result.get("pending")),
+                    "reason": str(result.get("reason") or "skipped"),
+                }
+            )
+    raise AppError("Backup did not start")
 
 
 def cmd_backup_cancel(_args: argparse.Namespace) -> int:
@@ -2101,6 +2728,7 @@ def cmd_backup(args: argparse.Namespace) -> int:
     dest = prepare_dest(name)
     started = time.time()
     lock_fd: int | None = None
+    scheduled = bool(getattr(args, "scheduled", False))
     _backup_progress_dest = name
     try:
         if not password_path(name).is_file():
@@ -2108,7 +2736,24 @@ def cmd_backup(args: argparse.Namespace) -> int:
         repo = str(dest.get("repository") or "")
         if not repo:
             raise AppError(f"Destination {name} has no repository")
+        spec = parse_schedule(dest.get("schedule"))
+        if scheduled:
+            if not schedule_enabled(spec):
+                write_schedule_result(name, skipped=True, reason="manual")
+                return 0
+            already_pending = bool(load_state(name).get("schedule_pending"))
+            if not already_pending and not scheduled_due_now(spec):
+                write_schedule_result(name, skipped=True, reason="not-due")
+                return 0
+            reachable, _reason = dest_reachable(dest)
+            if not reachable:
+                mark_schedule_pending(dest, notify=True)
+                return 0
         lock_fd = acquire_exclusive_work_lock(WORK_ROLE_BACKUP, name, preempt_pending=True)
+        if scheduled and not dest_has_changes(cfg, dest):
+            clear_schedule_pending(name)
+            write_schedule_result(name, skipped=True, reason="no-changes")
+            return 0
         reset_backup_progress_log()
 
         sources = [str(path) for path in source_paths(cfg)]
@@ -2131,16 +2776,12 @@ def cmd_backup(args: argparse.Namespace) -> int:
                 total_files=0,
             )
         )
-        measured = measure_selection(
-            cfg.get("sources", ["~"]),
-            cfg.get("exclude_paths", []),
-            cfg.get("excludes", []),
-        )
-        total_bytes = int(measured.get("bytes") or 0)
-        total_files = int(measured.get("files") or 0)
+        total_bytes = 0
+        total_files = 0
         last_percent = 0.0
         last_bytes_done = 0
         last_files_done = 0
+        rate_window = BackupRateWindow()
 
         def snapshot_progress(payload: dict[str, Any]) -> None:
             nonlocal last_percent, last_bytes_done, last_files_done
@@ -2165,6 +2806,7 @@ def cmd_backup(args: argparse.Namespace) -> int:
         while True:
             dest = prepare_dest(name)
             repo = str(dest.get("repository") or "")
+            rate_window.reset()
             cmd = [restic_bin(), *restic_rate_limit_args(dest), "-r", repo, *restic_args]
             proc = subprocess.Popen(
                 cmd,
@@ -2231,7 +2873,10 @@ def cmd_backup(args: argparse.Namespace) -> int:
                             total_bytes=total_bytes,
                             total_files=total_files,
                             started_at=started,
+                            rate_window=rate_window,
                         )
+                        total_bytes = max(total_bytes, int(payload.get("total_bytes") or 0))
+                        total_files = max(total_files, int(payload.get("total_files") or 0))
                         snapshot_progress(payload)
                         emit_backup_event(payload)
                     elif message_type == "summary":
@@ -2262,6 +2907,20 @@ def cmd_backup(args: argparse.Namespace) -> int:
                     files_done=last_files_done,
                     total_files=total_files,
                 )
+                if total_bytes > 0 or last_bytes_done > 0:
+                    emit_backup_event(
+                        backup_progress_payload(
+                            phase="running",
+                            percent=last_percent,
+                            eta_seconds=-1,
+                            seconds_elapsed=int(max(0, time.time() - started)),
+                            bytes_done=last_bytes_done,
+                            total_bytes=total_bytes,
+                            bytes_per_second=0.0,
+                            files_done=last_files_done,
+                            total_files=total_files,
+                        )
+                    )
                 continue
 
             if code != 0:
@@ -2303,6 +2962,8 @@ def cmd_backup(args: argparse.Namespace) -> int:
             state["pending_changed"] = 0
             state["pending_checked_at"] = int(time.time())
             state["pending_since"] = 0
+            state["schedule_pending"] = False
+            state["schedule_pending_notified"] = False
             save_state(name, state)
 
         emit_backup_event(
@@ -2517,7 +3178,19 @@ def cmd_ls(args: argparse.Namespace) -> int:
             for root in roots
         ]
         return emit({"ok": True, "dest": name, "snapshot": snapshot, "path": "/", "entries": entries})
-    result = run_restic(name, ["ls", "--json", snapshot, path])
+    try:
+        result = run_restic(name, ["ls", "--json", snapshot, path])
+    except AppError:
+        return emit(
+            {
+                "ok": True,
+                "dest": name,
+                "snapshot": snapshot,
+                "path": path,
+                "entries": [],
+                "missing": True,
+            }
+        )
     entries: list[dict[str, Any]] = []
     seen: set[str] = set()
     prefix = path.rstrip("/")
@@ -2568,6 +3241,58 @@ def cmd_restore(args: argparse.Namespace) -> int:
         if restored.exists():
             opened = str(restored)
     return emit({"ok": True, "dest": name, "snapshot": snapshot, "target": str(target), "opened": opened})
+
+
+def cmd_preview(args: argparse.Namespace) -> int:
+    name = safe_name(args.dest)
+    snapshot = args.snapshot or "latest"
+    path = args.path or ""
+    entry_name = Path(path).name or path or "/"
+    base = {
+        "ok": True,
+        "name": entry_name,
+        "path": path or "/",
+        "size": 0,
+        "mtime": "",
+        "text": "",
+        "image_path": "",
+    }
+    if not path or path == "/":
+        return emit({**base, "kind": "dir"})
+    node = ls_node(name, snapshot, path)
+    if node:
+        entry_name = str(node.get("name") or entry_name)
+        base["name"] = entry_name
+        base["size"] = int(node.get("size") or 0)
+        base["mtime"] = str(node.get("mtime") or "")
+        if str(node.get("type") or "file") == "dir":
+            return emit({**base, "kind": "dir"})
+    size = int(base["size"] or 0)
+    ext = preview_extension(entry_name or path)
+    want_image = ext in PREVIEW_IMAGE_EXTS
+    if size > PREVIEW_IMAGE_LIMIT and want_image:
+        return emit({**base, "kind": "unsupported"})
+    if size > PREVIEW_TEXT_LIMIT and not want_image:
+        return emit({**base, "kind": "unsupported"})
+    try:
+        data = run_restic_bytes(name, ["dump", snapshot, path])
+    except AppError:
+        return emit({**base, "kind": "unsupported"})
+    base["size"] = len(data)
+    image_ext = image_kind_from_bytes(data) or (ext if want_image else None)
+    if image_ext:
+        prune_preview_cache()
+        digest = hashlib.sha256(f"{name}:{snapshot}:{path}".encode("utf-8")).hexdigest()[:16]
+        out = PREVIEW_DIR / f"{digest}.{image_ext}"
+        PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(data)
+        return emit({**base, "kind": "image", "image_path": str(out)})
+    if looks_like_text(data):
+        text = data.decode("utf-8", errors="replace")
+        if len(text) > PREVIEW_TEXT_LIMIT:
+            text = text[:PREVIEW_TEXT_LIMIT]
+        return emit({**base, "kind": "text", "text": text})
+    return emit({**base, "kind": "unsupported"})
 
 
 def cmd_forget(args: argparse.Namespace) -> int:
@@ -2788,31 +3513,44 @@ def install_schedules() -> list[str]:
     enabled: list[str] = []
     for dest in cfg.get("destinations", []):
         name = safe_name(str(dest.get("name", "")))
-        calendar = str(dest.get("schedule") or "").strip()
+        spec = parse_schedule(dest.get("schedule"))
         timer_path = USER_SYSTEMD / f"omackup-{name}.timer"
-        if not calendar:
+        if not schedule_enabled(spec) or schedule_error(spec):
             if timer_path.exists():
                 subprocess.run(["systemctl", "--user", "disable", "--now", timer_path.name], check=False)
                 timer_path.unlink(missing_ok=True)
             continue
-        write_unit(
-            timer_path,
-            "\n".join(
-                [
-                    "[Unit]",
-                    f"Description=Omackup schedule ({name})",
-                    "",
-                    "[Timer]",
-                    f"Unit=omackup@{name}.service",
-                    f"OnCalendar={calendar}",
-                    "Persistent=true",
-                    "",
-                    "[Install]",
-                    "WantedBy=timers.target",
-                    "",
-                ]
-            ),
+        lines = [
+            "[Unit]",
+            f"Description=Omackup schedule ({name})",
+            "",
+            "[Timer]",
+            f"Unit=omackup-scheduled@{name}.service",
+            "Persistent=true",
+        ]
+        if spec["kind"] == "interval":
+            minutes = int(spec["minutes"])
+            lines.append(f"OnActiveSec={minutes}min")
+            lines.append(f"OnUnitInactiveSec={minutes}min")
+            lines.append("AccuracySec=1min")
+        else:
+            calendars = timer_calendars(spec)
+            if not calendars:
+                if timer_path.exists():
+                    subprocess.run(["systemctl", "--user", "disable", "--now", timer_path.name], check=False)
+                    timer_path.unlink(missing_ok=True)
+                continue
+            for calendar in calendars:
+                lines.append(f"OnCalendar={calendar}")
+        lines.extend(
+            [
+                "",
+                "[Install]",
+                "WantedBy=timers.target",
+                "",
+            ]
         )
+        write_unit(timer_path, "\n".join(lines))
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
         result = subprocess.run(
             ["systemctl", "--user", "enable", "--now", timer_path.name],
@@ -2854,7 +3592,13 @@ def cmd_launcher_uninstall(_args: argparse.Namespace) -> int:
 def cmd_schedule_set(args: argparse.Namespace) -> int:
     cfg = load_config()
     dest = find_dest(cfg, args.dest)
-    dest["schedule"] = "" if args.manual else (args.calendar or "")
+    if args.manual:
+        dest["schedule"] = default_schedule_spec(False)
+    else:
+        dest["schedule"] = parse_schedule(args.schedule or args.calendar or "")
+        err = schedule_error(dest["schedule"])
+        if err:
+            raise AppError(err)
     save_config(cfg)
     install_schedules()
     return emit({"ok": True, "destination": dest_public(find_dest(load_config(), args.dest))})
@@ -2886,7 +3630,7 @@ def build_parser() -> argparse.ArgumentParser:
     dest_add.add_argument("--kind", required=True, choices=["usb", "nas", "cloud"])
     dest_add.add_argument("--repository", required=True)
     dest_add.add_argument("--display-name", default="")
-    dest_add.add_argument("--schedule", default="")
+    dest_add.add_argument("--schedule", default="", help="JSON schedule spec, or empty for manual only")
     dest_add.add_argument("--pre-command", default="")
     dest_add.add_argument(
         "--rate-limit-kibs",
@@ -2937,9 +3681,11 @@ def build_parser() -> argparse.ArgumentParser:
     backup = sub.add_parser("backup", help="Run a backup")
     backup.add_argument("--dest", required=True)
     backup.add_argument("--dry-run", action="store_true")
+    backup.add_argument("--scheduled", action="store_true", help="Skip if not due, unreachable, or unchanged")
 
     backup_start = sub.add_parser("backup-start", help="Start a backup as a systemd user service")
     backup_start.add_argument("--dest", required=True)
+    backup_start.add_argument("--scheduled", action="store_true")
 
     sub.add_parser("backup-cancel", help="Stop the running backup")
     sub.add_parser("backup-follow", help="Stream backup progress events")
@@ -2960,6 +3706,11 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--snapshot", default="latest")
     restore.add_argument("--path", default="")
     restore.add_argument("--target", default="")
+
+    preview = sub.add_parser("preview", help="Preview a file from a snapshot")
+    preview.add_argument("--dest", required=True)
+    preview.add_argument("--snapshot", default="latest")
+    preview.add_argument("--path", required=True)
 
     forget = sub.add_parser("forget", help="Apply retention and prune")
     forget.add_argument("--dest", required=True)
@@ -2983,6 +3734,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     schedule_set = sub.add_parser("schedule-set", help="Change one destination schedule")
     schedule_set.add_argument("--dest", required=True)
+    schedule_set.add_argument("--schedule", default="")
     schedule_set.add_argument("--calendar", default="")
     schedule_set.add_argument("--manual", action="store_true")
 
@@ -3014,6 +3766,7 @@ COMMANDS = {
     "snapshots": cmd_snapshots,
     "ls": cmd_ls,
     "restore": cmd_restore,
+    "preview": cmd_preview,
     "forget": cmd_forget,
     "check": cmd_check,
     "mounts": cmd_mounts,

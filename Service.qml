@@ -38,6 +38,26 @@ Item {
   property string dirsPath: ""
   property string dirsParent: ""
   property string listingPath: "/"
+  property bool restoreOpen: false
+  property string restoreDest: ""
+  property string restoreDestDisplay: ""
+  property string restoreSnapshot: "latest"
+  property int restoreSnapIndex: 0
+  property int restoreEntryIndex: 0
+  property string restoreFocus: "timeline"
+  property var restoreSelected: null
+  property var preview: ({
+    kind: "",
+    name: "",
+    path: "",
+    size: 0,
+    mtime: "",
+    text: "",
+    image_path: ""
+  })
+  property bool previewLoading: false
+  property int previewSeq: 0
+  property int previewJobSeq: 0
   property string homePath: ""
   property var expandedPaths: ({})
   property var childrenByPath: ({})
@@ -98,6 +118,7 @@ Item {
   property int lastNotifiedPending: -1
   property int lastNotifiedStaleSince: 0
   property string lastNotifiedOverdueKey: ""
+  property string lastNotifiedPendingDestKey: ""
   property var _notifyQueue: []
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 60, 15, 3600)
@@ -115,6 +136,21 @@ Item {
     if (open) _openPanels += 1
     else if (_openPanels > 0) _openPanels -= 1
     panelOpen = _openPanels > 0
+  }
+
+  function destByName(name) {
+    var list = destinations || []
+    var i
+    for (i = 0; i < list.length; i++) {
+      if (list[i] && String(list[i].name) === String(name)) return list[i]
+    }
+    return null
+  }
+
+  function destDisplayName(name) {
+    var dest = destByName(name)
+    if (!dest) return String(name || "")
+    return String(dest.display_name || dest.name || name)
   }
 
   function destIsReachable(name) {
@@ -335,6 +371,7 @@ Item {
     else if (lastError.indexOf("restic is not installed") === 0) lastError = ""
     if (parsed.active_backup) handleBackupPayload(parsed.active_backup)
     evaluateNotifications()
+    Qt.callLater(root.startPendingScheduledBackups)
   }
 
   function mergePendingIntoDestinations(results) {
@@ -397,6 +434,12 @@ Item {
     return oldest
   }
 
+  function destHasSchedule(dest) {
+    if (!dest) return false
+    if (dest.schedule && dest.schedule.enabled === true) return true
+    return Model.scheduleEnabled(dest.schedule)
+  }
+
   function overdueDestNames() {
     var names = []
     var list = destinations || []
@@ -404,11 +447,35 @@ Item {
     for (i = 0; i < list.length; i++) {
       var dest = list[i]
       if (!dest || dest.overdue !== true) continue
-      if (!String(dest.schedule || "")) continue
+      if (dest.schedule_pending) continue
+      if (!destHasSchedule(dest)) continue
       names.push(String(dest.display_name || dest.name || "destination"))
     }
     names.sort()
     return names
+  }
+
+  function pendingDestNames() {
+    var names = []
+    var list = destinations || []
+    var i
+    for (i = 0; i < list.length; i++) {
+      var dest = list[i]
+      if (!dest || dest.schedule_pending !== true) continue
+      if (dest.schedule_pending_notified === true) continue
+      names.push(String(dest.display_name || dest.name || "destination"))
+    }
+    names.sort()
+    return names
+  }
+
+  readonly property bool hasSchedulePending: {
+    var list = destinations || []
+    var i
+    for (i = 0; i < list.length; i++) {
+      if (list[i] && list[i].schedule_pending === true) return true
+    }
+    return false
   }
 
   function notifyPending(total) {
@@ -429,6 +496,18 @@ Item {
   }
 
   function evaluateNotifications() {
+    var pendingNames = pendingDestNames()
+    var pendingKey = pendingNames.join("\n")
+    if (pendingNames.length === 0) {
+      lastNotifiedPendingDestKey = ""
+    } else if (notifyOnMissedBackup && pendingKey !== lastNotifiedPendingDestKey) {
+      lastNotifiedPendingDestKey = pendingKey
+      if (pendingNames.length === 1)
+        sendNotify("Backup pending", pendingNames[0] + " is not connected. Backup will start when it is.")
+      else
+        sendNotify("Backup pending", pendingNames.length + " destinations are waiting to be connected")
+    }
+
     var overdueNames = overdueDestNames()
     var overdueKey = overdueNames.join("\n")
     if (overdueNames.length === 0) {
@@ -703,6 +782,10 @@ Item {
     applySelection(Model.rightClickItem(path, draftSources, draftExcludePaths, homePath))
   }
 
+  function cycleItem(path) {
+    applySelection(Model.cycleItem(path, draftSources, draftExcludePaths, homePath))
+  }
+
   function setSources(paths) {
     applySelection({ sources: paths || [], excludePaths: draftExcludePaths })
   }
@@ -890,7 +973,30 @@ Item {
     })
   }
 
-  function backupNow(name) {
+  property var pendingReachableSince: ({})
+
+  function startPendingScheduledBackups() {
+    if (root.dormant) return
+    if (backupActive || backupStarting) return
+    var list = destinations || []
+    var now = Date.now()
+    var next = {}
+    var i
+    for (i = 0; i < list.length; i++) {
+      var dest = list[i]
+      var name = dest && dest.name ? String(dest.name) : ""
+      if (!dest || dest.schedule_pending !== true || !name) continue
+      if (dest.reachable !== true) continue
+      next[name] = pendingReachableSince[name] || now
+      if (now - next[name] < 2500) continue
+      pendingReachableSince = next
+      backupNow(name, true)
+      return
+    }
+    pendingReachableSince = next
+  }
+
+  function backupNow(name, scheduled) {
     if (root.dormant) return
     if (backupActive || backupStarting) {
       lastError = "A backup is already running"
@@ -912,8 +1018,6 @@ Item {
     backupTotalFiles = 0
     backupDisconnected = false
     backupPhase = "calculating"
-    backupActive = true
-    backupStarting = true
     backupCancelling = false
     actionStatus = ""
     if (pendingProc.running) {
@@ -921,9 +1025,19 @@ Item {
       pendingScanning = false
       pendingProc.running = false
     }
+    var args = ["backup-start", "--dest", backupDest]
+    if (scheduled) args.push("--scheduled")
+    backupActive = true
+    backupStarting = true
     startBackupFollow()
-    run(["backup-start", "--dest", backupDest], function() {
-      backupStarting = false
+    run(args, function(payload) {
+      if (payload && payload.skipped) {
+        clearBackupUi()
+        Qt.callLater(root.refresh)
+        return
+      }
+      backupActive = true
+      startBackupFollow()
     }, function(err) {
       backupStarting = false
       backupActive = false
@@ -995,10 +1109,14 @@ Item {
         return
       }
       backupDisconnected = false
-      if (phase === "calculating" || phase === "starting") backupPhase = "calculating"
-      else if (phase === "running") backupPhase = "running"
-      else if (totalBytes > 0 || percent > 0) backupPhase = "running"
-      else backupPhase = "calculating"
+      if (phase === "running" || totalBytes > 0 || percent > 0)
+        backupPhase = "running"
+      else if ((phase === "calculating" || phase === "starting") && (backupTotalBytes > 0 || backupBytesDone > 0))
+        backupPhase = "running"
+      else if (phase === "calculating" || phase === "starting")
+        backupPhase = "calculating"
+      else
+        backupPhase = backupPhase === "running" ? "running" : "calculating"
       backupEtaSeconds = payload.eta_seconds === undefined || payload.eta_seconds === null
         ? -1
         : Number(payload.eta_seconds)
@@ -1069,14 +1187,164 @@ Item {
     })
   }
 
-  function loadListing(name, snapshot, path, onDone) {
+  function loadListing(name, snapshot, path, onDone, onErr) {
     actionStatus = "Reading files…"
     run(["ls", "--dest", name, "--snapshot", snapshot, "--path", path], function(payload) {
       actionStatus = ""
       listingPath = String(payload.path || path)
       listing = payload.entries || []
+      if (payload.missing && path && path !== "/") {
+        loadListing(name, snapshot, Model.parentPath(path), onDone, onErr)
+        return
+      }
       if (onDone) onDone(payload)
+    }, function(err) {
+      actionStatus = ""
+      if (onErr) onErr(err)
     })
+  }
+
+  function openRestore(name) {
+    var dest = String(name || "")
+    if (!dest) return
+    if (!destIsReachable(dest)) {
+      lastError = "Destination is not reachable"
+      return
+    }
+    restoreDest = dest
+    restoreDestDisplay = destDisplayName(dest)
+    restoreSnapshot = "latest"
+    restoreSnapIndex = 0
+    restoreEntryIndex = 0
+    restoreFocus = "timeline"
+    restoreSelected = null
+    preview = Model.emptyPreview()
+    previewLoading = false
+    listing = []
+    listingPath = "/"
+    restoreOpen = true
+    loadSnapshots(dest, function(items) {
+      restoreSnapIndex = 0
+      if (!items || !items.length) return
+      selectRestoreSnapshot(items[0], "/")
+    })
+  }
+
+  function closeRestore() {
+    restoreOpen = false
+    previewLoading = false
+    previewSeq += 1
+    if (previewProc.running) previewProc.running = false
+    preview = Model.emptyPreview()
+  }
+
+  function selectRestoreSnapshot(snap, path) {
+    if (!restoreDest || !snap) return
+    restoreSnapshot = String(snap.id || snap.full_id || "latest")
+    var list = snapshots || []
+    var i
+    restoreSnapIndex = 0
+    for (i = 0; i < list.length; i++) {
+      if (String(list[i].id || list[i].full_id) === restoreSnapshot) {
+        restoreSnapIndex = i
+        break
+      }
+    }
+    restoreFocus = "timeline"
+    var selected = restoreSelected
+    openRestoreFolder(path || listingPath || "/", true)
+    if (selected && selected.type !== "dir" && selected.path)
+      loadPreview(restoreDest, restoreSnapshot, selected.path)
+  }
+
+  function openRestoreFolder(path, keepSelection) {
+    if (!restoreDest) return
+    loadListing(restoreDest, restoreSnapshot, path || "/", function(payload) {
+      restoreEntryIndex = 0
+      if (!keepSelection) {
+        restoreSelected = {
+          type: "dir",
+          name: Model.basename(listingPath),
+          path: listingPath === "/" ? "" : listingPath,
+          size: 0
+        }
+        preview = {
+          kind: "dir",
+          name: listingPath === "/" ? "Backups" : Model.basename(listingPath),
+          path: listingPath,
+          size: 0,
+          mtime: "",
+          text: "",
+          image_path: ""
+        }
+        previewLoading = false
+      }
+    })
+  }
+
+  function goRestoreUp() {
+    if (!listingPath || listingPath === "/") return
+    openRestoreFolder(Model.parentPath(listingPath))
+  }
+
+  function selectRestoreEntry(entry, index) {
+    if (!entry) return
+    if (index !== undefined && index >= 0) restoreEntryIndex = index
+    restoreSelected = entry
+    restoreFocus = "browser"
+    if (entry.type === "dir") {
+      previewLoading = false
+      preview = {
+        kind: "dir",
+        name: entry.name,
+        path: entry.path,
+        size: 0,
+        mtime: String(entry.mtime || ""),
+        text: "",
+        image_path: ""
+      }
+      return
+    }
+    loadPreview(restoreDest, restoreSnapshot, entry.path)
+  }
+
+  function activateRestoreEntry(entry, index) {
+    if (!entry) return
+    if (entry.type === "dir") {
+      if (index !== undefined && index >= 0) restoreEntryIndex = index
+      openRestoreFolder(entry.path)
+      return
+    }
+    selectRestoreEntry(entry, index)
+  }
+
+  function restoreCurrent() {
+    if (!restoreDest) return
+    var path = ""
+    if (restoreSelected && restoreSelected.path)
+      path = restoreSelected.path
+    else if (listingPath && listingPath !== "/")
+      path = listingPath
+    restorePath(restoreDest, restoreSnapshot, path)
+  }
+
+  function loadPreview(name, snapshot, path) {
+    previewSeq += 1
+    var seq = previewSeq
+    previewJobSeq = seq
+    previewLoading = true
+    preview = {
+      kind: "",
+      name: Model.basename(path),
+      path: path,
+      size: 0,
+      mtime: "",
+      text: "",
+      image_path: ""
+    }
+    if (previewProc.running) previewProc.running = false
+    previewProc.command = [helperPath, "preview", "--dest", name, "--snapshot", snapshot, "--path", path]
+    previewProc.running = true
   }
 
   function restorePath(name, snapshot, path) {
@@ -1091,9 +1359,9 @@ Item {
     })
   }
 
-  function setSchedule(name, calendar) {
+  function setSchedule(name, spec) {
     var args = ["schedule-set", "--dest", name]
-    if (calendar) args.push("--calendar", calendar)
+    if (spec) args.push("--schedule", typeof spec === "string" ? spec : JSON.stringify(spec))
     else args.push("--manual")
     run(args, function() { refresh() })
   }
@@ -1151,7 +1419,7 @@ Item {
     id: reconnectPollTimer
     interval: 3000
     repeat: true
-    running: !root.dormant && root.panelOpen
+    running: !root.dormant && (root.panelOpen || root.hasSchedulePending)
     onTriggered: {
       if (!root.refreshing) root.refresh()
     }
@@ -1273,6 +1541,52 @@ Item {
       }
       root.selectionSizeLoading = false
     }
+  }
+
+  Process {
+    id: previewProc
+    running: false
+    command: []
+    stdout: StdioCollector {
+      id: previewStdout
+      waitForEnd: true
+    }
+    stderr: StdioCollector {
+      id: previewStderr
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      var seq = root.previewJobSeq
+      if (seq !== root.previewSeq) return
+      root.previewLoading = false
+      var stdout = String(previewStdout.text || "")
+      var payload = Model.parseJson(stdout, null)
+      if (exitCode !== 0 || !payload || payload.ok === false) {
+        root.preview = {
+          kind: "unsupported",
+          name: root.preview && root.preview.name ? root.preview.name : "",
+          path: root.preview && root.preview.path ? root.preview.path : "",
+          size: 0,
+          mtime: "",
+          text: "",
+          image_path: ""
+        }
+        return
+      }
+      root.preview = {
+        kind: String(payload.kind || "binary"),
+        name: String(payload.name || ""),
+        path: String(payload.path || ""),
+        size: Number(payload.size || 0),
+        mtime: String(payload.mtime || ""),
+        text: String(payload.text || ""),
+        image_path: String(payload.image_path || "")
+      }
+    }
+  }
+
+  RestoreWindow {
+    omackup: root
   }
 
   Process {

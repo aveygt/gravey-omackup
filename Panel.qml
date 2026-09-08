@@ -15,20 +15,24 @@ Panel {
 
   property string screen: "overview"
   property string previousScreen: "overview"
+  property string mainTab: "destinations"
   property int destIndex: 0
   property int destKindIndex: 0
   property int sourceIndex: 0
   property int excludeIndex: 0
   property int mountIndex: 0
   property int dirIndex: 0
-  property int snapIndex: 0
-  property int entryIndex: 0
   property bool cursorActive: false
   property bool formFocused: false
 
   property string destName: ""
   property string destDisplay: ""
-  property string destSchedule: "*-*-* 03:00:00"
+  property bool destScheduleEnabled: false
+  property string destScheduleKind: "daily"
+  property string destScheduleMinutes: "60"
+  property string destScheduleTimes: "300"
+  property var destScheduleWeekdays: [true, false, false, false, false, false, false]
+  property string destScheduleMonthDay: "1"
   property string destPassword: ""
   property string destPreCommand: ""
   property string destRateLimitText: "0"
@@ -47,15 +51,16 @@ Panel {
   property string editingExclude: ""
   property string editingExcludeDraft: ""
   property var excludeEditField: null
-  property bool excludesExpanded: false
-  property string restoreDest: ""
-  property string restoreSnapshot: "latest"
   property string pendingDest: ""
   property string passwordCopyStatus: ""
   property string editingDestKind: ""
   property string editingDestRepo: ""
   property bool sourcesHelpOpen: false
   property bool excludesHelpOpen: false
+  property bool focusExcludeDraft: false
+  property bool cancelConfirmOpen: false
+  property string confirmKind: ""
+  property string pendingRemoveExclude: ""
   property int backupBarTick: 0
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -94,8 +99,82 @@ Panel {
     if (omackup.destinations.length === 0) return null
     return omackup.destinations[Math.max(0, Math.min(destIndex, omackup.destinations.length - 1))]
   }
+  readonly property bool onDestinationsTab: screen === "overview" && mainTab === "destinations"
+  readonly property bool onFilesTab: screen === "overview" && mainTab === "files"
+  readonly property bool onExclusionsTab: screen === "overview" && mainTab === "exclusions"
+  readonly property bool onSourcesTab: onFilesTab || onExclusionsTab
+  readonly property bool onSourcesFiles: onFilesTab
+  readonly property bool onSourcesExclusions: onExclusionsTab
+  readonly property var shortcutHints: {
+    if (cancelConfirmOpen)
+      return ["←→\u00A0choose", "enter\u00A0confirm", "esc\u00A0back"]
+    if (onExclusionsTab && editingExclude !== "")
+      return ["enter\u00A0save", "c\u00A0cancel"]
+    if (formFocused) {
+      if (onExclusionsTab) return ["enter\u00A0add", "esc\u00A0back"]
+      return ["esc\u00A0back"]
+    }
+    if (sourcesHelpOpen || excludesHelpOpen)
+      return ["?\u00A0close", "esc\u00A0back"]
+    if (onDestinationsTab) {
+      var destHints = ["d\u00A0dest", "f\u00A0files", "e\u00A0exclusions", "a\u00A0add"]
+      if ((omackup.destinations || []).length) {
+        destHints.push("↑↓\u00A0select")
+        destHints.push("enter\u00A0edit")
+        destHints.push("b\u00A0backup")
+        destHints.push("r\u00A0restore")
+      }
+      if (omackup.backupActive || omackup.backupStarting) destHints.push("c\u00A0cancel")
+      destHints.push("g\u00A0settings")
+      return destHints
+    }
+    if (onFilesTab) {
+      var fileHints = ["d\u00A0dest", "f\u00A0files", "e\u00A0exclusions"]
+      if (omackup.treeRows && omackup.treeRows.count) {
+        fileHints.push("↑↓\u00A0select")
+        fileHints.push("←→\u00A0expand")
+        fileHints.push("space\u00A0cycle")
+      }
+      fileHints.push("u\u00A0reload")
+      fileHints.push("?\u00A0help")
+      if (omackup.sourcesDirty) {
+        fileHints.push("s\u00A0save")
+        fileHints.push("c\u00A0cancel")
+      }
+      fileHints.push("g\u00A0settings")
+      return fileHints
+    }
+    if (onExclusionsTab) {
+      var exclusionHints = ["d\u00A0dest", "f\u00A0files", "e\u00A0exclusions", "a\u00A0add"]
+      if ((omackup.draftExcludes || []).length) {
+        exclusionHints.push("↑↓\u00A0select")
+        exclusionHints.push("enter\u00A0edit")
+        exclusionHints.push("r\u00A0remove")
+      }
+      exclusionHints.push("?\u00A0help")
+      if (omackup.sourcesDirty) {
+        exclusionHints.push("s\u00A0save")
+        exclusionHints.push("c\u00A0cancel")
+      }
+      exclusionHints.push("g\u00A0settings")
+      return exclusionHints
+    }
+    if (screen === "settings")
+      return ["esc\u00A0back"]
+    if (screen === "destKind")
+      return ["↑↓\u00A0select", "enter\u00A0choose", "1\u00A0usb", "2\u00A0nas", "3\u00A0cloud", "esc\u00A0back"]
+    if (screen === "destUsb")
+      return ["↑↓\u00A0select", "enter\u00A0choose", "r\u00A0rescan", "s\u00A0create", "esc\u00A0back"]
+    if (screen === "destEdit")
+      return ["enter\u00A0save", "esc\u00A0back"]
+    if (screen === "destNas" || screen === "destCloud")
+      return ["enter\u00A0create", "esc\u00A0back"]
+    if (screen === "passwordWarn")
+      return ["c\u00A0copy", "s\u00A0show", "enter\u00A0done", "esc\u00A0back"]
+    return []
+  }
   readonly property string heroDetail: {
-    if (screen === "overview" || screen === "sources" || screen === "destEdit" || screen === "settings") return ""
+    if (screen === "overview" || screen === "destEdit" || screen === "settings") return ""
     return screenTitle()
   }
 
@@ -104,25 +183,55 @@ Panel {
     screen = name
     formFocused = false
     cursorActive = name === "overview" || name === "destKind" || name === "destUsb"
-      || name === "restoreSnaps" || name === "restoreBrowse" || name === "sources"
     sourcesHelpOpen = false
     excludesHelpOpen = false
     if (panelFlick) panelFlick.contentY = 0
     if (name === "passwordWarn") passwordCopyStatus = ""
     if (name === "destUsb") scanUsbMounts()
-    if (name === "sources") {
-      omackup.beginSourcesEdit()
-      omackup.ensureHomeTree()
-    } else {
-      if (omackup.sourcesEditing) omackup.cancelSourcesEdit()
-      if (name !== "destUsb") {
-        highlightExclude = ""
-        editingExclude = ""
-        editingExcludeDraft = ""
-        excludeEditField = null
-        excludesExpanded = false
-      }
+    if (name === "overview" && (mainTab === "files" || mainTab === "exclusions")) {
+      if (!omackup.sourcesEditing) omackup.beginSourcesEdit()
+      if (mainTab === "files") omackup.ensureHomeTree()
+    } else if (name !== "overview") {
+      dismissExcludeEditor()
+      highlightExclude = ""
+      editingExclude = ""
+      editingExcludeDraft = ""
+      excludeEditField = null
     }
+  }
+
+  function prepareSourcesTab(name) {
+    if (!omackup.sourcesEditing) omackup.beginSourcesEdit()
+    if (name === "files") {
+      omackup.ensureHomeTree()
+      omackup.refreshSelectionSize()
+    } else if (name === "exclusions") {
+      var list = omackup.draftExcludes || []
+      if (excludeIndex >= list.length) excludeIndex = Math.max(0, list.length - 1)
+      if (list.length) highlightExclude = String(list[excludeIndex] || "")
+    }
+  }
+
+  function showTab(name) {
+    if (name !== "destinations" && name !== "files" && name !== "exclusions") return
+    if (screen !== "overview") showScreen("overview")
+    if (mainTab === name) {
+      if (name === "files" || name === "exclusions") prepareSourcesTab(name)
+      return
+    }
+    mainTab = name
+    formFocused = false
+    cursorActive = true
+    sourcesHelpOpen = false
+    excludesHelpOpen = false
+    if (panelFlick) panelFlick.contentY = 0
+    if (name === "files" || name === "exclusions") {
+      if (name === "files") dismissExcludeEditor()
+      prepareSourcesTab(name)
+    } else {
+      dismissExcludeEditor()
+    }
+    if (keyCatcher) keyCatcher.forceActiveFocus()
   }
 
   function copyPassword() {
@@ -135,15 +244,15 @@ Panel {
 
   function revealExclude(pattern) {
     var value = String(pattern || "")
-    excludesExpanded = true
-    highlightExclude = value
-    editingExclude = value
-    editingExcludeDraft = value
+    showTab("exclusions")
+    selectExcludePattern(value)
+    beginEditExclude(value)
   }
 
   function beginEditExclude(pattern) {
     var value = String(pattern || "")
-    excludesExpanded = true
+    showTab("exclusions")
+    selectExcludePattern(value)
     highlightExclude = value
     editingExclude = value
     editingExcludeDraft = value
@@ -177,6 +286,7 @@ Panel {
     }
     highlightExclude = next
     omackup.replaceExclude(previous, next)
+    selectExcludePattern(next)
   }
 
   function dismissExcludeEditor() {
@@ -197,13 +307,106 @@ Panel {
     })
   }
 
+  function requestCancelBackup() {
+    if (!omackup.backupActive && !omackup.backupStarting) return
+    if (screen !== "overview") showScreen("overview")
+    if (mainTab !== "destinations") showTab("destinations")
+    openConfirm("cancelBackup")
+  }
+
+  function dismissCancelConfirm() {
+    cancelConfirmOpen = false
+    confirmKind = ""
+    pendingRemoveExclude = ""
+    if (keyCatcher) keyCatcher.forceActiveFocus()
+  }
+
+  function confirmCancelBackup() {
+    cancelConfirmOpen = false
+    confirmKind = ""
+    omackup.cancelBackup()
+    if (keyCatcher) keyCatcher.forceActiveFocus()
+  }
+
+  function openConfirm(kind) {
+    sourcesHelpOpen = false
+    excludesHelpOpen = false
+    confirmKind = kind
+    cancelConfirm.selectedIndex = 0
+    cancelConfirmOpen = true
+    Qt.callLater(function() {
+      if (cancelConfirmKeys) cancelConfirmKeys.forceActiveFocus()
+    })
+  }
+
+  function selectedExclude() {
+    var list = omackup.draftExcludes || []
+    if (!list.length) return ""
+    return String(list[Math.max(0, Math.min(excludeIndex, list.length - 1))] || "")
+  }
+
+  function selectExcludePattern(pattern) {
+    var value = String(pattern || "")
+    var list = omackup.draftExcludes || []
+    var i
+    for (i = 0; i < list.length; i++) {
+      if (String(list[i]) === value) {
+        excludeIndex = i
+        highlightExclude = value
+        return
+      }
+    }
+    highlightExclude = value
+  }
+
+  function editSelectedExclude() {
+    var pattern = selectedExclude()
+    if (!pattern) return
+    showTab("exclusions")
+    beginEditExclude(pattern)
+  }
+
+  function requestRemoveExclude(pattern) {
+    var value = String(pattern || selectedExclude() || "")
+    if (!value) return
+    pendingRemoveExclude = value
+    showTab("exclusions")
+    selectExcludePattern(value)
+    openConfirm("removeExclude")
+  }
+
+  function confirmRemoveExclude() {
+    var value = String(pendingRemoveExclude || "")
+    cancelConfirmOpen = false
+    confirmKind = ""
+    pendingRemoveExclude = ""
+    if (value) {
+      if (editingExclude === value) cancelEditExclude()
+      if (highlightExclude === value) highlightExclude = ""
+      omackup.removeExclude(value)
+      var list = omackup.draftExcludes || []
+      if (excludeIndex >= list.length) excludeIndex = Math.max(0, list.length - 1)
+      if (list.length) highlightExclude = String(list[excludeIndex] || "")
+    }
+    if (keyCatcher) keyCatcher.forceActiveFocus()
+  }
+
   function goBack() {
+    if (cancelConfirmOpen) {
+      dismissCancelConfirm()
+      return
+    }
+    if (editingExclude !== "") {
+      cancelEditExclude()
+      return
+    }
     if (sourcesHelpOpen || excludesHelpOpen) {
       sourcesHelpOpen = false
       excludesHelpOpen = false
       return
     }
     if (screen === "overview") {
+      if (omackup.sourcesEditing) omackup.cancelSourcesEdit()
       root.close()
       return
     }
@@ -211,16 +414,7 @@ Panel {
       showScreen("overview")
       return
     }
-    if (screen === "sources") {
-      omackup.cancelSourcesEdit()
-      showScreen("overview")
-      return
-    }
-    if (screen === "restoreBrowse") {
-      showScreen("restoreSnaps")
-      return
-    }
-    if (screen === "restoreSnaps" || screen === "passwordWarn" || screen === "destEdit") {
+    if (screen === "passwordWarn" || screen === "destEdit") {
       showScreen("overview")
       return
     }
@@ -233,20 +427,20 @@ Panel {
 
   function cancelSources() {
     omackup.cancelSourcesEdit()
-    showScreen("overview")
+    if (onSourcesTab) omackup.beginSourcesEdit()
   }
 
   function saveSources() {
     if (!omackup.sourcesDirty || omackup.sourcesSaving || omackup.busy) return
     omackup.saveSourcesEdit(function(ok) {
-      if (ok) showScreen("overview")
+      if (ok && onSourcesTab) omackup.beginSourcesEdit()
     })
   }
 
   function resetDestForm() {
     destName = ""
     destDisplay = ""
-    destSchedule = "*-*-* 03:00:00"
+    applyScheduleToForm(null)
     destPassword = ""
     destPreCommand = ""
     destRateLimitText = "0"
@@ -294,14 +488,120 @@ Panel {
     return omackup.treeRows.get(index)
   }
 
+  function beginAddExclude() {
+    showTab("exclusions")
+    sourcesHelpOpen = false
+    excludesHelpOpen = false
+    focusExcludeDraft = false
+    focusExcludeDraft = true
+  }
+
+  function toggleSourcesHelp() {
+    excludesHelpOpen = false
+    sourcesHelpOpen = !sourcesHelpOpen
+  }
+
+  function toggleExcludesHelp() {
+    sourcesHelpOpen = false
+    excludesHelpOpen = !excludesHelpOpen
+  }
+
   function handleTextKey(t) {
     var key = String(t || "").toLowerCase()
-    if (screen !== "overview") return
-    if (key === "e") editSelectedDest()
-    else if (key === "b") backupSelectedDest()
-    else if (key === "r") restoreSelectedDest()
-    else if (key === "s") showScreen("sources")
-    else if (key === "d") startAddDest()
+    if (cancelConfirmOpen) return
+    if (screen === "overview") {
+      if (key === "d") { showTab("destinations"); return }
+      if (key === "f") { showTab("files"); return }
+      if (key === "e") { showTab("exclusions"); return }
+      if (key === "g") { showScreen("settings"); return }
+      if (key === "?" || key === "/") {
+        if (onFilesTab) toggleSourcesHelp()
+        else if (onExclusionsTab) toggleExcludesHelp()
+        return
+      }
+      if (onDestinationsTab) {
+        if (key === "a") startAddDest()
+        else if (key === "b") backupSelectedDest()
+        else if (key === "c") requestCancelBackup()
+        else if (key === "r") restoreSelectedDest()
+        return
+      }
+      if (onFilesTab) {
+        if (key === "u") omackup.refreshHomeTree()
+        else if (key === "s") saveSources()
+        else if (key === "c") cancelSources()
+        return
+      }
+      if (onExclusionsTab) {
+        if (key === "a") beginAddExclude()
+        else if (key === "r") requestRemoveExclude()
+        else if (key === "s") saveSources()
+        else if (key === "c") cancelSources()
+      }
+      return
+    }
+    if (screen === "destKind") {
+      if (key === "1") { destKindIndex = 0; showScreen("destUsb") }
+      else if (key === "2") { destKindIndex = 1; showScreen("destNas") }
+      else if (key === "3") { destKindIndex = 2; showScreen("destCloud") }
+      return
+    }
+    if (screen === "destUsb") {
+      if (key === "r") scanUsbMounts()
+      else if (key === "s") saveUsbDest()
+      return
+    }
+    if (screen === "destNas" && key === "s") {
+      saveNasDest()
+      return
+    }
+    if (screen === "destCloud" && key === "s") {
+      saveCloudDest()
+      return
+    }
+    if (screen === "passwordWarn") {
+      if (key === "c") copyPassword()
+      else if (key === "s" && pendingDest) omackup.showKey(pendingDest)
+      return
+    }
+  }
+
+  function applyScheduleToForm(raw) {
+    var spec = Model.parseSchedule(raw)
+    destScheduleEnabled = spec.enabled === true
+    destScheduleKind = spec.kind || "daily"
+    destScheduleMinutes = String(spec.minutes || 60)
+    destScheduleTimes = String(spec.times_text || "300")
+    destScheduleWeekdays = spec.weekdays && spec.weekdays.length ? spec.weekdays.slice() : Model.defaultWeekdays()
+    destScheduleMonthDay = String(spec.monthday || 1)
+  }
+
+  function destScheduleSpec() {
+    return {
+      enabled: destScheduleEnabled,
+      kind: destScheduleKind,
+      minutes: parseInt(destScheduleMinutes, 10) || 60,
+      times_text: destScheduleTimes,
+      weekdays: destScheduleWeekdays,
+      monthday: parseInt(destScheduleMonthDay, 10) || 1
+    }
+  }
+
+  function destScheduleCliValue() {
+    var spec = destScheduleSpec()
+    if (!spec.enabled) return ""
+    var err = Model.scheduleError(spec)
+    if (err) {
+      omackup.lastError = err
+      return null
+    }
+    return Model.scheduleToCli(spec)
+  }
+
+  function toggleScheduleWeekday(index) {
+    var next = (destScheduleWeekdays || Model.defaultWeekdays()).slice()
+    next[index] = !next[index]
+    destScheduleWeekdays = next
   }
 
   function destRateLimitCliArgs() {
@@ -374,7 +674,7 @@ Panel {
     if (!dest) return
     destName = String(dest.name || "")
     destDisplay = String(dest.display_name || dest.name || "")
-    destSchedule = String(dest.schedule || "")
+    applyScheduleToForm(dest.schedule)
     destPreCommand = String(dest.pre_command || "")
     destRateLimitText = Model.formatRateLimitField(dest.rate_limit_kibs)
     editingDestKind = String(dest.kind || "usb")
@@ -388,9 +688,11 @@ Panel {
       return
     }
     var display = String(destDisplay || destName).trim() || destName
+    var schedule = destScheduleCliValue()
+    if (schedule === null) return
     var args = [
       "dest-add", "--name", destName, "--kind", editingDestKind, "--repository", editingDestRepo,
-      "--display-name", display, "--schedule", destSchedule, "--pre-command", destPreCommand
+      "--display-name", display, "--schedule", schedule, "--pre-command", destPreCommand
     ]
     var limitArgs = root.destRateLimitCliArgs()
     if (!limitArgs) return
@@ -408,25 +710,10 @@ Panel {
   }
 
   function startRestore(name) {
-    restoreDest = name || (selectedDest ? selectedDest.name : "")
-    restoreSnapshot = "latest"
-    if (!restoreDest) return
-    if (!omackup.destIsReachable(restoreDest)) {
-      omackup.lastError = "Destination is not reachable"
-      return
-    }
-    omackup.loadSnapshots(restoreDest, function(items) {
-      snapIndex = 0
-      showScreen("restoreSnaps")
-    })
-  }
-
-  function openSnapshot(snap) {
-    restoreSnapshot = String(snap && (snap.id || snap.full_id) || "latest")
-    omackup.loadListing(restoreDest, restoreSnapshot, "/", function() {
-      entryIndex = 0
-      showScreen("restoreBrowse")
-    })
+    var dest = name || (selectedDest ? selectedDest.name : "")
+    if (!dest) return
+    omackup.openRestore(dest)
+    if (omackup.restoreOpen) root.close()
   }
 
   function destIdFromLabel(fallback) {
@@ -493,9 +780,11 @@ Panel {
 
   function finishDest(kind, name, repo, display, envPairs) {
     pendingDest = name
+    var schedule = destScheduleCliValue()
+    if (schedule === null) return
     var args = [
       "dest-add", "--name", name, "--kind", kind, "--repository", repo,
-      "--display-name", display, "--schedule", destSchedule, "--pre-command", destPreCommand
+      "--display-name", display, "--schedule", schedule, "--pre-command", destPreCommand
     ]
     var limitArgs = root.destRateLimitCliArgs()
     if (!limitArgs) return
@@ -517,10 +806,23 @@ Panel {
 
   function activateCursor() {
     if (screen === "overview") {
-      if (omackup.destinations.length === 0) startAddDest()
-      else backupSelectedDest()
+      if (onDestinationsTab) {
+        editSelectedDest()
+      } else if (onSourcesFiles) {
+        var row = sourceRowAt(sourceIndex)
+        if (row && row.path) {
+          cursorActive = true
+          omackup.cycleItem(row.path)
+        }
+      } else if (onSourcesExclusions) {
+        editSelectedExclude()
+      }
     } else if (screen === "destKind") {
       openSelectedDestKind()
+    } else if (screen === "destNas") {
+      saveNasDest()
+    } else if (screen === "destCloud") {
+      saveCloudDest()
     } else if (screen === "destUsb") {
       var mounts = omackup.mounts || []
       if (!mounts.length) return
@@ -530,15 +832,6 @@ Panel {
       saveDestEdit()
     } else if (screen === "passwordWarn") {
       showScreen("overview")
-    } else if (screen === "sources") {
-      var row = sourceRowAt(sourceIndex)
-      if (row && row.path) omackup.includeItem(row.path)
-    } else if (screen === "restoreSnaps" && omackup.snapshots.length) {
-      openSnapshot(omackup.snapshots[Math.max(0, Math.min(snapIndex, omackup.snapshots.length - 1))])
-    } else if (screen === "restoreBrowse" && omackup.listing.length) {
-      var entry = omackup.listing[Math.max(0, Math.min(entryIndex, omackup.listing.length - 1))]
-      if (entry && entry.type === "dir") omackup.loadListing(restoreDest, restoreSnapshot, entry.path)
-      else if (entry) omackup.restorePath(restoreDest, restoreSnapshot, entry.path)
     }
   }
 
@@ -557,13 +850,20 @@ Panel {
 
   onOpenedChanged: {
     if (omackup && omackup.setPanelOpen) omackup.setPanelOpen(opened)
-    if (opened && omackup) {
+    if (!opened) {
+      cancelConfirmOpen = false
+      confirmKind = ""
+      pendingRemoveExclude = ""
+      if (omackup && omackup.sourcesEditing) omackup.cancelSourcesEdit()
+      return
+    }
+    if (omackup) {
       cursorActive = screen === "overview" || screen === "destKind" || screen === "destUsb"
-        || screen === "restoreSnaps" || screen === "restoreBrowse" || screen === "sources"
       formFocused = false
       if (screen === "overview" && panelFlick) panelFlick.contentY = 0
       omackup.refresh()
-      if (screen === "sources") {
+      if (onSourcesTab) {
+        if (!omackup.sourcesEditing) omackup.beginSourcesEdit()
         omackup.ensureHomeTree()
         omackup.refreshSelectionSize()
       }
@@ -658,22 +958,25 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(420))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(620))
+    contentHeight: panel.fittedContentHeight(
+      column.implicitHeight + (shortcutBar.visible ? Style.space(12) + shortcutBar.implicitHeight : 0),
+      Style.space(620)
+    )
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.formFocused
+      blocked: root.formFocused || root.cancelConfirmOpen
       onMoveRequested: function(dx, dy) {
         root.cursorActive = true
-        if (root.screen === "overview") {
+        if (root.onDestinationsTab) {
           if (omackup.destinations.length) destIndex = Math.max(0, Math.min(omackup.destinations.length - 1, destIndex + dy))
         } else if (root.screen === "destKind") {
           destKindIndex = Math.max(0, Math.min(2, destKindIndex + dy))
         } else if (root.screen === "destUsb" && omackup.mounts.length) {
           mountIndex = Math.max(0, Math.min(omackup.mounts.length - 1, mountIndex + dy))
           root.selectUsbMount(omackup.mounts[mountIndex].path)
-        } else if (root.screen === "sources" && omackup.treeRows.count) {
+        } else if (root.onSourcesFiles && omackup.treeRows.count) {
           if (dy !== 0) {
             sourceIndex = Math.max(0, Math.min(omackup.treeRows.count - 1, sourceIndex + dy))
           } else if (dx !== 0) {
@@ -683,13 +986,15 @@ Panel {
               else if (dx < 0 && row.expanded) omackup.toggleExpand(row.path)
             }
           }
-        } else if (root.screen === "restoreSnaps" && omackup.snapshots.length) {
-          snapIndex = Math.max(0, Math.min(omackup.snapshots.length - 1, snapIndex + dy))
-        } else if (root.screen === "restoreBrowse" && omackup.listing.length) {
-          entryIndex = Math.max(0, Math.min(omackup.listing.length - 1, entryIndex + dy))
+        } else if (root.onSourcesExclusions) {
+          var excludes = omackup.draftExcludes || []
+          if (excludes.length && dy !== 0) {
+            excludeIndex = Math.max(0, Math.min(excludes.length - 1, excludeIndex + dy))
+            highlightExclude = String(excludes[excludeIndex] || "")
+          }
         }
       }
-      onActivateRequested: if (root.cursorActive) root.activateCursor()
+      onActivateRequested: root.activateCursor()
       onCloseRequested: root.goBack()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) { root.handleTextKey(t) }
@@ -715,7 +1020,11 @@ Panel {
 
       Flickable {
         id: panelFlick
-        anchors.fill: parent
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: shortcutBar.top
+        anchors.bottomMargin: shortcutBar.visible ? Style.space(8) : 0
         contentWidth: width
         contentHeight: column.implicitHeight
         clip: true
@@ -744,10 +1053,68 @@ Panel {
                 font.pixelSize: Style.font.display
               }
             }
-            trailingControl: root.screen === "sources" ? sourcesTopActions
-              : (root.screen === "destEdit" ? destEditTopActions
+            trailingControl: root.screen === "destEdit" ? destEditTopActions
               : (root.screen === "settings" ? settingsBack
-              : (root.screen === "overview" ? settingsGear : null)))
+              : (root.screen === "overview" ? settingsGear : null))
+          }
+
+          Row {
+            visible: root.screen === "overview"
+            width: parent.width
+            spacing: Style.space(8)
+
+            Button {
+              width: (parent.width - parent.spacing * 2) / 3
+              text: "Destinations"
+              foreground: root.foreground
+              bordered: true
+              selected: root.mainTab === "destinations"
+              onClicked: root.showTab("destinations")
+            }
+
+            Button {
+              width: (parent.width - parent.spacing * 2) / 3
+              text: "Files"
+              foreground: root.foreground
+              bordered: true
+              selected: root.mainTab === "files"
+              onClicked: root.showTab("files")
+            }
+
+            Button {
+              width: (parent.width - parent.spacing * 2) / 3
+              text: "Exclusions"
+              foreground: root.foreground
+              bordered: true
+              selected: root.mainTab === "exclusions"
+              onClicked: root.showTab("exclusions")
+            }
+          }
+
+          Item {
+            visible: root.onSourcesTab
+            width: parent.width
+            height: visible ? sourcesTabActions.implicitHeight : 0
+
+            Row {
+              id: sourcesTabActions
+              anchors.right: parent.right
+              spacing: Style.space(8)
+
+              Button {
+                text: "Cancel"
+                foreground: root.foreground
+                enabled: !omackup.sourcesSaving
+                onClicked: root.cancelSources()
+              }
+
+              Button {
+                text: omackup.sourcesSaving ? "Saving…" : "Save"
+                foreground: root.foreground
+                enabled: omackup.sourcesDirty && !omackup.sourcesSaving && !omackup.busy
+                onClicked: root.saveSources()
+              }
+            }
           }
 
           Text {
@@ -767,7 +1134,8 @@ Panel {
           Loader {
             width: parent.width
             sourceComponent: {
-              if (root.screen === "sources") return sourcesPage
+              if (root.onFilesTab) return filesPage
+              if (root.onExclusionsTab) return exclusionsPage
               if (root.screen === "settings") return settingsPage
               if (root.screen === "destKind") return destKindPage
               if (root.screen === "destUsb") return destUsbPage
@@ -775,17 +1143,64 @@ Panel {
               if (root.screen === "destCloud") return destCloudPage
               if (root.screen === "destEdit") return destEditPage
               if (root.screen === "passwordWarn") return passwordPage
-              if (root.screen === "restoreSnaps") return restoreSnapsPage
-              if (root.screen === "restoreBrowse") return restoreBrowsePage
               return overviewPage
             }
           }
         }
       }
 
+      Flow {
+        id: shortcutBar
+        visible: root.shortcutHints.length > 0
+        height: visible ? implicitHeight : 0
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        spacing: Style.space(12)
+
+        Repeater {
+          model: root.shortcutHints
+          Text {
+            required property string modelData
+            text: modelData
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.NoWrap
+          }
+        }
+      }
+
+      Item {
+        id: cancelConfirmKeys
+        anchors.fill: parent
+        visible: root.cancelConfirmOpen
+        focus: root.cancelConfirmOpen
+        z: 4000
+        Keys.onPressed: function(event) {
+          if (cancelConfirm.handleKey(event)) event.accepted = true
+        }
+
+        ConfirmDialog {
+          id: cancelConfirm
+          anchors.fill: parent
+          opened: root.cancelConfirmOpen
+          message: root.confirmKind === "removeExclude" ? "Remove this exclusion?" : "Cancel this backup?"
+          cancelText: "No"
+          confirmText: "Yes"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onCanceled: root.dismissCancelConfirm()
+          onConfirmed: {
+            if (root.confirmKind === "removeExclude") root.confirmRemoveExclude()
+            else root.confirmCancelBackup()
+          }
+        }
+      }
+
       Item {
         anchors.fill: parent
-        visible: (root.sourcesHelpOpen || root.excludesHelpOpen) && root.screen === "sources"
+        visible: (root.sourcesHelpOpen || root.excludesHelpOpen) && root.onSourcesTab
         z: 2000
 
         Rectangle {
@@ -857,8 +1272,8 @@ Panel {
             Text {
               width: parent.width
               text: root.excludesHelpOpen
-                ? "Open this section with the chevron. Add glob rules like **/node_modules or *.iso to skip matching paths everywhere in your selection.\n\nClick a dashed red name in the tree to jump to the pattern that matched it.\n\nReset defaults restores the built-in pattern list."
-                : "Left click includes a file or folder.\n\nLeft click again removes it from the selection.\n\nRight click excludes it. That item stays out until you left-click it again."
+                ? "Add glob rules like **/node_modules or *.iso to skip matching paths everywhere in your selection.\n\nClick a dashed red name in the file tree to jump to the pattern that matched it.\n\nReset defaults restores the built-in pattern list."
+                : "Left click includes a file or folder.\n\nLeft click again removes it from the selection.\n\nRight click excludes it. That item stays out until you left-click it again.\n\nSpace cycles off → included → excluded."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -871,7 +1286,6 @@ Panel {
   }
 
   function screenTitle() {
-    if (screen === "sources") return "Sources"
     if (screen === "settings") return "Settings"
     if (screen === "destKind") return "Add destination"
     if (screen === "destUsb") return "USB drive"
@@ -879,8 +1293,6 @@ Panel {
     if (screen === "destCloud") return "Cloud"
     if (screen === "destEdit") return "Edit destination"
     if (screen === "passwordWarn") return "Save this password"
-    if (screen === "restoreSnaps") return "Restore"
-    if (screen === "restoreBrowse") return "Browse"
     return ""
   }
 
@@ -949,40 +1361,9 @@ Panel {
     width: parent.width
     spacing: Style.space(12)
 
-    Row {
-      width: parent.width
-      spacing: Style.space(8)
-
-      Button {
-        text: "Sources"
-        foreground: root.foreground
-        onClicked: root.showScreen("sources")
-      }
-    }
-
-    Text {
-      width: parent.width
-      text: "↑↓ dest   e edit   b backup   r restore   s sources   d add dest"
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      wrapMode: Text.WordWrap
-    }
-
-    PanelSeparator { foreground: root.foreground }
-
     Item {
       width: parent.width
-      height: Math.max(destinationsHeader.implicitHeight, addDestBtn.implicitHeight)
-
-      PanelSectionHeader {
-        id: destinationsHeader
-        anchors.left: parent.left
-        anchors.verticalCenter: parent.verticalCenter
-        text: "DESTINATIONS"
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-      }
+      height: addDestBtn.implicitHeight
 
       Button {
         id: addDestBtn
@@ -1017,7 +1398,7 @@ Panel {
           readonly property bool showBackupSuccess: !destRow.isBackingUp
             && omackup.backupSuccessDest === String(modelData.name)
           width: parent.width
-          hasCursor: root.cursorActive && root.screen === "overview" && root.destIndex === index
+          hasCursor: root.cursorActive && root.onDestinationsTab && root.destIndex === index
           foreground: root.foreground
           implicitHeight: (destRow.isBackingUp ? backupDestCol.implicitHeight : idleDestCol.implicitHeight)
             + Style.spacing.rowPaddingX
@@ -1088,10 +1469,12 @@ Panel {
                   }
                   Text {
                     width: parent.width
-                    text: modelData.reachable === false
-                      ? (modelData.reachable_error || "Not reachable")
-                      : Model.destMeta(modelData, omackup.use24HourTime)
-                    color: modelData.reachable === false || modelData.failed || modelData.overdue ? root.urgent : root.dim
+                    text: modelData.schedule_pending
+                      ? "Backup pending — connect this destination"
+                      : modelData.reachable === false
+                        ? (modelData.reachable_error || "Not reachable")
+                        : Model.destMeta(modelData, omackup.use24HourTime)
+                    color: modelData.reachable === false || modelData.failed || modelData.overdue || modelData.schedule_pending ? root.urgent : root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     elide: Text.ElideRight
@@ -1107,7 +1490,7 @@ Panel {
                   }
                   Text {
                     width: parent.width
-                    text: Model.scheduleLabel(modelData.schedule)
+                    text: modelData.schedule_label || Model.scheduleLabel(modelData.schedule)
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -1261,7 +1644,7 @@ Panel {
                 horizontalPadding: Style.space(10)
                 verticalPadding: Style.space(4)
                 anchors.verticalCenter: parent.verticalCenter
-                onClicked: omackup.cancelBackup()
+                onClicked: root.requestCancelBackup()
               }
             }
 
@@ -1290,30 +1673,73 @@ Panel {
     }
   }
 
-  component SourcesPage: Column {
+  component FilesPage: Column {
     width: parent.width
     spacing: Style.space(12)
 
-    Row {
+    Item {
       width: parent.width
-      spacing: Style.space(6)
+      height: Math.max(Style.space(28), treeRefreshBtn.implicitHeight)
 
-      Text {
-        text: omackup.selectionSizeText
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.body
-        wrapMode: Text.NoWrap
+      Row {
+        anchors.left: parent.left
+        anchors.right: filesHeaderActions.left
+        anchors.rightMargin: Style.space(8)
         anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(6)
+
+        Text {
+          text: omackup.selectionSizeText
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.NoWrap
+          elide: Text.ElideRight
+          anchors.verticalCenter: parent.verticalCenter
+        }
+
+        Text {
+          visible: omackup.selectionSizeLoading
+          text: omackup.selectionSizeSpinner
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          anchors.verticalCenter: parent.verticalCenter
+        }
       }
 
-      Text {
-        visible: omackup.selectionSizeLoading
-        text: omackup.selectionSizeSpinner
-        color: root.dim
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.body
+      Row {
+        id: filesHeaderActions
+        anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(2)
+
+        Button {
+          text: ""
+          iconText: "?"
+          tooltipText: "How selection works"
+          foreground: root.foreground
+          horizontalPadding: Style.space(4)
+          verticalPadding: Style.space(2)
+          iconSize: Style.font.body
+          selected: root.sourcesHelpOpen
+          enabled: !omackup.sourcesSaving
+          onClicked: root.toggleSourcesHelp()
+        }
+
+        Button {
+          id: treeRefreshBtn
+          text: ""
+          iconText: "󰑐"
+          iconSpinning: omackup.treeLoading
+          tooltipText: "Reload the file tree"
+          foreground: root.foreground
+          horizontalPadding: Style.space(4)
+          verticalPadding: Style.space(2)
+          iconSize: Style.font.body
+          enabled: !omackup.treeLoading && !omackup.sourcesSaving
+          onClicked: omackup.refreshHomeTree()
+        }
       }
     }
 
@@ -1333,130 +1759,65 @@ Panel {
       onClicked: omackup.ensureHomeTree()
     }
 
-    Item {
+    Column {
       width: parent.width
-      height: Math.max(treeColumn.implicitHeight, treeRefreshBtn.implicitHeight)
+      spacing: 0
 
-      Column {
-        id: treeColumn
-        width: parent.width
-        spacing: 0
-
-        Repeater {
-          model: omackup.treeRows
-          TreeRow {
-            required property int index
-            required property string path
-            required property string name
-            required property string type
-            required property int depth
-            required property bool expanded
-            required property bool hasChildren
-            width: parent.width
-            hasCursor: root.cursorActive && root.screen === "sources" && root.sourceIndex === index
-            rowIndex: index
-            node: ({
-              path: path,
-              name: name,
-              type: type,
-              depth: depth,
-              expanded: expanded,
-              hasChildren: hasChildren
-            })
-          }
-        }
-      }
-
-      Row {
-        anchors.top: parent.top
-        anchors.right: parent.right
-        z: 1
-        spacing: Style.space(2)
-
-        Button {
-          text: ""
-          iconText: "?"
-          tooltipText: "How selection works"
-          foreground: root.foreground
-          horizontalPadding: Style.space(4)
-          verticalPadding: Style.space(2)
-          iconSize: Style.font.body
-          selected: root.sourcesHelpOpen
-          enabled: !omackup.sourcesSaving
-          onClicked: {
-            root.excludesHelpOpen = false
-            root.sourcesHelpOpen = !root.sourcesHelpOpen
-          }
-        }
-
-        Button {
-          id: treeRefreshBtn
-          text: ""
-          iconText: "󰑐"
-          iconSpinning: omackup.treeLoading
-          tooltipText: "Reload the file tree"
-          foreground: root.foreground
-          horizontalPadding: Style.space(4)
-          verticalPadding: Style.space(2)
-          iconSize: Style.font.body
-          enabled: !omackup.treeLoading && !omackup.sourcesSaving
-          onClicked: omackup.refreshHomeTree()
+      Repeater {
+        model: omackup.treeRows
+        TreeRow {
+          required property int index
+          required property string path
+          required property string name
+          required property string type
+          required property int depth
+          required property bool expanded
+          required property bool hasChildren
+          width: parent.width
+          hasCursor: root.cursorActive && root.onSourcesFiles && root.sourceIndex === index
+          rowIndex: index
+          node: ({
+            path: path,
+            name: name,
+            type: type,
+            depth: depth,
+            expanded: expanded,
+            hasChildren: hasChildren
+          })
         }
       }
     }
+  }
 
-    PanelSeparator { foreground: root.foreground }
+  component ExclusionsPage: Column {
+    width: parent.width
+    spacing: Style.space(12)
 
     Item {
-      id: excludesHeader
       width: parent.width
       height: Math.max(Style.space(28), excludesHelpBtn.implicitHeight)
 
-      CursorSurface {
+      Row {
         anchors.left: parent.left
         anchors.right: excludesHelpBtn.left
-        anchors.rightMargin: Style.space(4)
+        anchors.rightMargin: Style.space(8)
         anchors.verticalCenter: parent.verticalCenter
-        height: parent.height
-        foreground: root.foreground
+        spacing: Style.space(6)
 
-        MouseArea {
-          anchors.fill: parent
-          cursorShape: Qt.PointingHandCursor
-          onClicked: {
-            root.excludesExpanded = !root.excludesExpanded
-            if (!root.excludesExpanded) root.cancelEditExclude()
-          }
+        PanelSectionHeader {
+          text: "EXCLUSION PATTERNS"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          anchors.verticalCenter: parent.verticalCenter
         }
 
-        Row {
-          anchors.fill: parent
-          anchors.leftMargin: Style.space(4)
-          spacing: Style.space(6)
-
-          Text {
-            text: root.excludesExpanded ? "󰅀" : "󰅂"
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            anchors.verticalCenter: parent.verticalCenter
-          }
-
-          PanelSectionHeader {
-            text: "EXCLUSION PATTERNS"
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            anchors.verticalCenter: parent.verticalCenter
-          }
-
-          Text {
-            visible: (omackup.draftExcludes || []).length > 0
-            text: String((omackup.draftExcludes || []).length)
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            anchors.verticalCenter: parent.verticalCenter
-          }
+        Text {
+          visible: (omackup.draftExcludes || []).length > 0
+          text: String((omackup.draftExcludes || []).length)
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          anchors.verticalCenter: parent.verticalCenter
         }
       }
 
@@ -1472,64 +1833,86 @@ Panel {
         verticalPadding: Style.space(2)
         iconSize: Style.font.body
         selected: root.excludesHelpOpen
-        onClicked: {
-          root.sourcesHelpOpen = false
-          root.excludesHelpOpen = !root.excludesHelpOpen
-        }
+        onClicked: root.toggleExcludesHelp()
       }
     }
 
     Column {
-      visible: root.excludesExpanded
       width: parent.width
-      spacing: Style.space(12)
+      spacing: 0
 
-      Column {
-        width: parent.width
-        spacing: 0
-
-        Repeater {
-          model: omackup.draftExcludes
-          ExcludeRuleRow {
-            required property var modelData
-            width: parent.width
-            pattern: String(modelData || "")
-          }
+      Repeater {
+        model: omackup.draftExcludes
+        ExcludeRuleRow {
+          required property var modelData
+          required property int index
+          width: parent.width
+          pattern: String(modelData || "")
+          rowIndex: index
+          hasCursor: root.cursorActive && root.onSourcesExclusions && root.excludeIndex === index
         }
       }
+    }
 
-      TextField {
-        width: parent.width
-        placeholderText: "Pattern, e.g. **/node_modules"
-        text: root.excludeDraft
+    TextField {
+      id: excludeDraftField
+      width: parent.width
+      placeholderText: "Pattern, e.g. **/node_modules"
+      text: root.excludeDraft
+      foreground: root.foreground
+      enabled: !omackup.sourcesSaving
+      onTextChanged: root.excludeDraft = text
+      onActiveFocusChanged: root.formFocused = activeFocus
+      onAccepted: {
+        if (root.excludeDraft) omackup.addExclude(root.excludeDraft)
+        root.excludeDraft = ""
+        text = ""
+      }
+      onVisibleChanged: {
+        if (visible && root.focusExcludeDraft) {
+          Qt.callLater(function() {
+            excludeDraftField.forceActiveFocus()
+            root.formFocused = true
+            root.focusExcludeDraft = false
+            root.scrollToItem(excludeDraftField)
+          })
+        }
+      }
+      Keys.onEscapePressed: {
+        root.formFocused = false
+        if (keyCatcher) keyCatcher.forceActiveFocus()
+      }
+      Connections {
+        target: root
+        function onFocusExcludeDraftChanged() {
+          if (!root.focusExcludeDraft || !excludeDraftField.visible) return
+          Qt.callLater(function() {
+            if (!root.focusExcludeDraft || !excludeDraftField.visible) return
+            excludeDraftField.forceActiveFocus()
+            root.formFocused = true
+            root.focusExcludeDraft = false
+            root.scrollToItem(excludeDraftField)
+          })
+        }
+      }
+    }
+
+    Row {
+      spacing: Style.space(8)
+      Button {
+        text: "Add pattern"
+        foreground: root.foreground
+        enabled: root.excludeDraft !== "" && !omackup.sourcesSaving
+        onClicked: {
+          omackup.addExclude(root.excludeDraft)
+          root.excludeDraft = ""
+        }
+      }
+      Button {
+        text: "Reset defaults"
         foreground: root.foreground
         enabled: !omackup.sourcesSaving
-        onTextChanged: root.excludeDraft = text
-        onActiveFocusChanged: root.formFocused = activeFocus
-        onAccepted: {
-          if (root.excludeDraft) omackup.addExclude(root.excludeDraft)
-          root.excludeDraft = ""
-          text = ""
-        }
-      }
-
-      Row {
-        spacing: Style.space(8)
-        Button {
-          text: "Add pattern"
-          foreground: root.foreground
-          enabled: root.excludeDraft !== "" && !omackup.sourcesSaving
-          onClicked: {
-            omackup.addExclude(root.excludeDraft)
-            root.excludeDraft = ""
-          }
-        }
-        Button {
-          text: "Reset defaults"
-          foreground: root.foreground
-          enabled: !omackup.sourcesSaving
-          onClicked: omackup.resetExcludes()
-        }
+        onClicked: omackup.resetExcludes()
       }
     }
   }
@@ -1537,8 +1920,11 @@ Panel {
   component ExcludeRuleRow: CursorSurface {
     id: excludeRow
     property string pattern: ""
+    property int rowIndex: 0
     property string draft: pattern
-    readonly property bool focused: root.highlightExclude === pattern && pattern !== ""
+    readonly property bool focused: root.onSourcesExclusions
+      ? root.excludeIndex === rowIndex && pattern !== ""
+      : (root.highlightExclude === pattern && pattern !== "")
     readonly property bool editing: root.editingExclude === pattern && pattern !== ""
 
     implicitHeight: editing ? Math.max(Style.space(28), editField.implicitHeight) : Style.space(24)
@@ -1581,7 +1967,11 @@ Panel {
         MouseArea {
           anchors.fill: parent
           cursorShape: Qt.PointingHandCursor
-          onClicked: root.beginEditExclude(excludeRow.pattern)
+          onClicked: {
+            root.showTab("exclusions")
+            root.excludeIndex = excludeRow.rowIndex
+            root.beginEditExclude(excludeRow.pattern)
+          }
         }
       }
 
@@ -1610,6 +2000,12 @@ Panel {
         }
         onAccepted: root.commitEditExclude(excludeRow.pattern, excludeRow.draft)
         Keys.onEscapePressed: root.cancelEditExclude()
+        Keys.onPressed: function(event) {
+          if (String(event.text || "").toLowerCase() === "c") {
+            root.cancelEditExclude()
+            event.accepted = true
+          }
+        }
       }
 
       Button {
@@ -1620,11 +2016,7 @@ Panel {
         horizontalPadding: Style.space(4)
         verticalPadding: Style.space(2)
         iconSize: Style.font.body
-        onClicked: {
-          if (root.editingExclude === excludeRow.pattern) root.cancelEditExclude()
-          if (root.highlightExclude === excludeRow.pattern) root.highlightExclude = ""
-          omackup.removeExclude(excludeRow.pattern)
-        }
+        onClicked: root.requestRemoveExclude(excludeRow.pattern)
       }
     }
   }
@@ -1799,7 +2191,11 @@ Panel {
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
       acceptedButtons: Qt.LeftButton | Qt.RightButton
-      onEntered: { root.cursorActive = true; root.sourceIndex = treeRow.rowIndex }
+      onEntered: {
+        if (root.editingExclude !== "" || root.cancelConfirmOpen) return
+        root.cursorActive = true
+        root.sourceIndex = treeRow.rowIndex
+      }
       onClicked: function(mouse) {
         if (mouse.button === Qt.RightButton) {
           omackup.excludeItem(treeRow.node.path)
@@ -1943,14 +2339,7 @@ Panel {
       wrapMode: Text.WrapAnywhere
     }
 
-    Dropdown {
-      width: parent.width
-      label: "Schedule"
-      value: root.destSchedule
-      options: Model.scheduleOptions()
-      foreground: root.foreground
-      onChanged: function(value) { root.destSchedule = value }
-    }
+    DestScheduleFields {}
 
     LabeledField {
       label: "Pre-command (optional)"
@@ -2238,20 +2627,146 @@ Panel {
       text: root.destPassword
       onChanged: root.destPassword = value
     }
-    Dropdown {
-      width: parent.width
-      label: "Schedule"
-      value: root.destSchedule
-      options: Model.scheduleOptions()
-      foreground: root.foreground
-      onChanged: function(value) { root.destSchedule = value }
-    }
+    DestScheduleFields {}
 
     LabeledField {
       label: "Rate limit (0 is unlimited)"
       placeholder: "10mb/s"
       text: root.destRateLimitText
       onChanged: root.destRateLimitText = value
+    }
+  }
+
+  component DestScheduleFields: Column {
+    width: parent.width
+    spacing: Style.space(8)
+
+    Item {
+      width: parent.width
+      height: Math.max(scheduleSwitch.implicitHeight, scheduleKind.implicitHeight, scheduleManual.implicitHeight)
+
+      ToggleSwitch {
+        id: scheduleSwitch
+        cursorRing: false
+        checked: root.destScheduleEnabled
+        foreground: root.foreground
+        accent: Color.accent
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        onToggled: root.destScheduleEnabled = !root.destScheduleEnabled
+      }
+
+      Text {
+        id: scheduleManual
+        visible: !root.destScheduleEnabled
+        anchors.left: scheduleSwitch.right
+        anchors.leftMargin: Style.space(8)
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        text: "Manual only"
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        wrapMode: Text.WordWrap
+      }
+
+      Dropdown {
+        id: scheduleKind
+        visible: root.destScheduleEnabled
+        anchors.left: scheduleSwitch.right
+        anchors.leftMargin: Style.space(8)
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        height: implicitHeight
+        showLabel: false
+        value: root.destScheduleKind
+        options: Model.scheduleKindOptions()
+        foreground: root.foreground
+        onChanged: function(value) { root.destScheduleKind = value }
+      }
+    }
+
+    LabeledField {
+      visible: root.destScheduleEnabled && root.destScheduleKind === "interval"
+      label: "Every (minutes)"
+      placeholder: "30"
+      text: root.destScheduleMinutes
+      onChanged: root.destScheduleMinutes = value
+    }
+
+    LabeledField {
+      visible: root.destScheduleEnabled && root.destScheduleKind === "daily"
+      label: "Times (2:30pm = 1430, 3am = 300)"
+      placeholder: "300, 1300, 1430"
+      text: root.destScheduleTimes
+      onChanged: root.destScheduleTimes = value
+    }
+
+    Column {
+      visible: root.destScheduleEnabled && root.destScheduleKind === "weekly"
+      width: parent.width
+      spacing: Style.space(6)
+
+      Row {
+        spacing: Style.space(4)
+
+        Repeater {
+          model: 7
+          CursorSurface {
+            required property int index
+            width: Style.space(22)
+            implicitHeight: Style.space(22)
+            foreground: root.foreground
+            bordered: true
+            current: !!root.destScheduleWeekdays[index]
+
+            Text {
+              anchors.centerIn: parent
+              text: Model.weekdayLabels()[index]
+              color: root.destScheduleWeekdays[index] ? root.foreground : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.toggleScheduleWeekday(index)
+            }
+          }
+        }
+      }
+
+      LabeledField {
+        label: "Times (2:30PM = 1430, 3AM = 300)"
+        placeholder: "300, 1300, 1430"
+        text: root.destScheduleTimes
+        onChanged: root.destScheduleTimes = value
+      }
+    }
+
+    Column {
+      visible: root.destScheduleEnabled && root.destScheduleKind === "monthly"
+      width: parent.width
+      spacing: Style.space(4)
+
+      LabeledField {
+        label: "Day of the month"
+        placeholder: "15"
+        text: root.destScheduleMonthDay
+        onChanged: root.destScheduleMonthDay = value
+      }
+
+      Text {
+        width: parent.width
+        visible: parseInt(root.destScheduleMonthDay, 10) > 28
+        text: "On shorter months this runs on the last day, at 03:00."
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
     }
   }
 
@@ -2329,153 +2844,6 @@ Panel {
     }
   }
 
-  component RestoreSnapsPage: Column {
-    width: parent.width
-    spacing: Style.space(10)
-
-    Button {
-      text: "Back"
-      foreground: root.foreground
-      onClicked: root.showScreen("overview")
-    }
-
-    Text {
-      visible: omackup.snapshots.length === 0
-      width: parent.width
-      text: omackup.busy ? "Reading snapshots…" : "No snapshots yet. Run a backup first."
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.body
-      wrapMode: Text.WordWrap
-    }
-
-    Repeater {
-      model: omackup.snapshots
-      CursorSurface {
-        required property var modelData
-        required property int index
-        width: parent.width
-        hasCursor: root.cursorActive && root.screen === "restoreSnaps" && root.snapIndex === index
-        foreground: root.foreground
-        implicitHeight: Style.space(36)
-        onHasCursorChanged: if (hasCursor) root.scrollToItem(this)
-        MouseArea {
-          anchors.fill: parent
-          hoverEnabled: true
-          cursorShape: Qt.PointingHandCursor
-          onEntered: { root.cursorActive = true; root.snapIndex = index }
-          onClicked: root.openSnapshot(modelData)
-        }
-        Column {
-          anchors.left: parent.left
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          anchors.leftMargin: Style.space(10)
-          Text {
-            text: Model.snapshotLabel(modelData)
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-          }
-          Text {
-            text: String(modelData.id || "")
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-        }
-      }
-    }
-  }
-
-  component RestoreBrowsePage: Column {
-    width: parent.width
-    spacing: Style.space(10)
-
-    Row {
-      spacing: Style.space(8)
-      Button {
-        text: "Back"
-        foreground: root.foreground
-        onClicked: root.showScreen("restoreSnaps")
-      }
-      Button {
-        text: "Up"
-        foreground: root.foreground
-        enabled: omackup.listingPath !== "/" && omackup.listingPath !== ""
-        onClicked: omackup.loadListing(root.restoreDest, root.restoreSnapshot, Model.parentPath(omackup.listingPath))
-      }
-      Button {
-        text: "Restore this folder"
-        foreground: root.foreground
-        enabled: !omackup.busy
-        onClicked: omackup.restorePath(root.restoreDest, root.restoreSnapshot, omackup.listingPath === "/" ? "" : omackup.listingPath)
-      }
-    }
-
-    Text {
-      width: parent.width
-      text: omackup.listingPath || "/"
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      elide: Text.ElideMiddle
-    }
-
-    Repeater {
-      model: omackup.listing
-      CursorSurface {
-        required property var modelData
-        required property int index
-        width: parent.width
-        hasCursor: root.cursorActive && root.screen === "restoreBrowse" && root.entryIndex === index
-        foreground: root.foreground
-        implicitHeight: Style.space(32)
-        onHasCursorChanged: if (hasCursor) root.scrollToItem(this)
-        MouseArea {
-          anchors.fill: parent
-          hoverEnabled: true
-          cursorShape: Qt.PointingHandCursor
-          onEntered: { root.cursorActive = true; root.entryIndex = index }
-          onClicked: {
-            if (modelData.type === "dir") omackup.loadListing(root.restoreDest, root.restoreSnapshot, modelData.path)
-            else omackup.restorePath(root.restoreDest, root.restoreSnapshot, modelData.path)
-          }
-        }
-        Row {
-          anchors.fill: parent
-          anchors.leftMargin: Style.space(8)
-          anchors.rightMargin: Style.space(8)
-          spacing: Style.space(8)
-          Text {
-            text: Model.entryGlyph(modelData)
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.icon
-            anchors.verticalCenter: parent.verticalCenter
-          }
-          Text {
-            width: parent.width - Style.space(80)
-            text: modelData.name
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            elide: Text.ElideRight
-            anchors.verticalCenter: parent.verticalCenter
-          }
-          Text {
-            visible: modelData.type !== "dir"
-            text: Model.formatBytes(modelData.size)
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            anchors.verticalCenter: parent.verticalCenter
-          }
-        }
-      }
-    }
-  }
-
   component LabeledField: Column {
     property string label: ""
     property string placeholder: ""
@@ -2515,42 +2883,50 @@ Panel {
     }
   }
 
-  Component { id: settingsGear
-    Button {
-      text: ""
-      iconText: "󰒓"
-      tooltipText: "Settings"
-      foreground: root.foreground
-      horizontalPadding: Style.space(4)
-      verticalPadding: Style.space(2)
-      iconSize: Style.font.body
+  component SettingsGearButton: BorderSurface {
+    id: gear
+    readonly property int fontPx: Style.font.body
+    readonly property int hitPad: Style.space(10)
+    readonly property int box: Math.max(Style.space(40), gear.fontPx + gear.hitPad * 2)
+
+    implicitWidth: box
+    implicitHeight: box
+    width: box
+    height: box
+    radius: Style.cornerRadius
+    color: gearMouse.containsMouse ? Style.hoverFillFor(root.foreground, root.foreground) : "transparent"
+
+    OpticalGlyph {
+      anchors.fill: parent
+      text: "󰒓"
+      fontFamily: root.fontFamily
+      fontSize: gear.fontPx
+      color: root.foreground
+    }
+
+    MouseArea {
+      id: gearMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
       onClicked: root.showScreen("settings")
     }
+
+    PanelToolTip {
+      visible: gearMouse.containsMouse
+      text: "Settings"
+      fontFamily: root.fontFamily
+    }
+  }
+
+  Component { id: settingsGear
+    SettingsGearButton {}
   }
   Component { id: settingsBack
     Button {
       text: "Back"
       foreground: root.foreground
       onClicked: root.showScreen("overview")
-    }
-  }
-  Component { id: sourcesTopActions
-    Row {
-      spacing: Style.space(8)
-
-      Button {
-        text: "Cancel"
-        foreground: root.foreground
-        enabled: !omackup.sourcesSaving
-        onClicked: root.cancelSources()
-      }
-
-      Button {
-        text: omackup.sourcesSaving ? "Saving…" : "Save"
-        foreground: root.foreground
-        enabled: omackup.sourcesDirty && !omackup.sourcesSaving && !omackup.busy
-        onClicked: root.saveSources()
-      }
     }
   }
   Component { id: destEditTopActions
@@ -2574,13 +2950,12 @@ Panel {
   }
   Component { id: overviewPage; OverviewPage { width: column.width } }
   Component { id: settingsPage; SettingsPage { width: column.width } }
-  Component { id: sourcesPage; SourcesPage { width: column.width } }
+  Component { id: filesPage; FilesPage { width: column.width } }
+  Component { id: exclusionsPage; ExclusionsPage { width: column.width } }
   Component { id: destKindPage; DestKindPage { width: column.width } }
   Component { id: destEditPage; DestEditPage { width: column.width } }
   Component { id: destUsbPage; DestUsbPage { width: column.width } }
   Component { id: destNasPage; DestNasPage { width: column.width } }
   Component { id: destCloudPage; DestCloudPage { width: column.width } }
   Component { id: passwordPage; PasswordPage { width: column.width } }
-  Component { id: restoreSnapsPage; RestoreSnapsPage { width: column.width } }
-  Component { id: restoreBrowsePage; RestoreBrowsePage { width: column.width } }
 }

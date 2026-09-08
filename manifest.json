@@ -5,7 +5,7 @@
   "version": "1.1.0",
   "author": "gravey",
   "license": "MIT",
-  "description": "Incremental restic backups of personal files to USB, NAS, and cloud, with a restore browser in the Omarchy bar.",
+  "description": "Incremental restic backups of personal files to USB, NAS, and cloud, with a floating restore browser.",
   "kinds": [
     "service",
     "bar-widget"

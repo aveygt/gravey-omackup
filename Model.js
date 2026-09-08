@@ -208,6 +208,7 @@ function formatBackupStats(percent, filesDone, filesTotal, bytesDone, bytesTotal
 
 function destMeta(dest, use24Hour) {
   if (!dest) return ""
+  if (dest.schedule_pending) return "Backup pending — connect this destination"
   if (dest.failed) return dest.last_error || "Last backup failed"
   if (dest.overdue) return "Overdue · last " + formatWhen(dest.last_success, use24Hour)
   if (dest.last_success) return formatWhen(dest.last_success, use24Hour)
@@ -267,24 +268,318 @@ function snapshotLabel(snap) {
   return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate()) + " " + pad(date.getHours()) + ":" + pad(date.getMinutes())
 }
 
-function scheduleOptions() {
+function snapshotDate(snap) {
+  if (!snap) return null
+  var date = new Date(String(snap.time || ""))
+  if (isNaN(date.getTime())) return null
+  return date
+}
+
+function snapshotDayKey(snap) {
+  var date = snapshotDate(snap)
+  if (!date) return "unknown"
+  var pad = function(n) { return n < 10 ? "0" + n : String(n) }
+  return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate())
+}
+
+function snapshotDayLabel(snap) {
+  var date = snapshotDate(snap)
+  if (!date) return "Unknown"
+  var now = new Date()
+  if (date.toDateString() === now.toDateString()) return "Today"
+  var yesterday = new Date(now.getTime() - 86400000)
+  if (date.toDateString() === yesterday.toDateString()) return "Yesterday"
+  var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+  return months[date.getMonth()] + " " + date.getDate() + ", " + date.getFullYear()
+}
+
+function snapshotClock(snap, use24Hour) {
+  return snapshotStamp(snap)
+}
+
+function snapshotStamp(snap) {
+  var date = snapshotDate(snap)
+  if (!date) return String(snap && snap.id || "snapshot")
+  var pad = function(n) { return n < 10 ? "0" + n : String(n) }
+  var yy = pad(date.getFullYear() % 100)
+  return pad(date.getMonth() + 1) + "/" + pad(date.getDate()) + "/" + yy
+    + " " + pad(date.getHours()) + ":" + pad(date.getMinutes())
+}
+
+function snapshotIdShort(snap) {
+  return String(snap && (snap.id || snap.full_id) || "").slice(0, 8)
+}
+
+function emptyPreview() {
+  return {
+    kind: "",
+    name: "",
+    path: "",
+    size: 0,
+    mtime: "",
+    text: "",
+    image_path: ""
+  }
+}
+
+function pathCrumbs(path) {
+  var raw = String(path || "/")
+  if (raw === "" || raw === "/") return [{ name: "Backups", path: "/" }]
+  var parts = raw.split("/").filter(function(part) { return part !== "" })
+  var crumbs = [{ name: "Backups", path: "/" }]
+  var acc = ""
+  var i
+  for (i = 0; i < parts.length; i++) {
+    acc += "/" + parts[i]
+    crumbs.push({ name: parts[i], path: acc })
+  }
+  return crumbs
+}
+
+function previewKindLabel(kind) {
+  if (kind === "image") return "Image"
+  if (kind === "text") return "Text"
+  if (kind === "dir") return "Folder"
+  if (kind === "too_large") return "Too large to preview"
+  if (kind === "binary") return "No preview"
+  if (kind === "missing") return "Not in this snapshot"
+  return ""
+}
+
+function weekdayLabels() {
+  return ["S", "M", "T", "W", "T", "F", "S"]
+}
+
+function defaultWeekdays() {
+  return [true, false, false, false, false, false, false]
+}
+
+function defaultScheduleSpec() {
+  return {
+    enabled: false,
+    kind: "daily",
+    minutes: 60,
+    times_text: "300",
+    weekdays: defaultWeekdays(),
+    monthday: 1
+  }
+}
+
+function scheduleKindOptions() {
   return [
-    { value: "", label: "Manual only" },
-    { value: "*-*-* 03:00:00", label: "Every night at 03:00" },
-    { value: "*-*-* 12:00:00", label: "Every day at 12:00" },
-    { value: "*-*-* 18:00:00", label: "Every day at 18:00" },
-    { value: "Mon..Fri *-*-* 03:00:00", label: "Weekdays at 03:00" }
+    { value: "interval", label: "Every x minutes" },
+    { value: "daily", label: "Daily" },
+    { value: "weekly", label: "Weekly" },
+    { value: "monthly", label: "Monthly" }
   ]
 }
 
-function scheduleLabel(schedule) {
-  var value = String(schedule || "")
-  var options = scheduleOptions()
+function parseClockToken(token) {
+  var text = String(token || "").trim().toLowerCase().replace(/\s+/g, "")
+  if (!text) return null
+  var hour
+  var minute
+  if (text.indexOf(":") >= 0) {
+    var parts = text.split(":")
+    if (parts.length !== 2) return null
+    hour = parseInt(parts[0], 10)
+    minute = parseInt(parts[1], 10)
+  } else {
+    if (!/^\d+$/.test(text)) return null
+    if (text.length <= 2) {
+      hour = parseInt(text, 10)
+      minute = 0
+    } else if (text.length === 3) {
+      hour = parseInt(text.charAt(0), 10)
+      minute = parseInt(text.substring(1), 10)
+    } else if (text.length === 4) {
+      hour = parseInt(text.substring(0, 2), 10)
+      minute = parseInt(text.substring(2), 10)
+    } else {
+      return null
+    }
+  }
+  if (!isFinite(hour) || !isFinite(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59)
+    return null
+  return { hour: hour, minute: minute }
+}
+
+function parseTimesText(text) {
+  var out = []
+  var seen = {}
+  var parts = String(text || "").split(",")
+  var i
+  for (i = 0; i < parts.length; i++) {
+    var parsed = parseClockToken(parts[i])
+    if (!parsed) continue
+    var key = parsed.hour + ":" + parsed.minute
+    if (seen[key]) continue
+    seen[key] = true
+    out.push(parsed)
+  }
+  return out
+}
+
+function formatClock(hour, minute) {
+  var h = hour < 10 ? "0" + hour : String(hour)
+  var m = minute < 10 ? "0" + minute : String(minute)
+  return h + ":" + m
+}
+
+function formatUserTime(hour, minute) {
+  if (hour < 10) return String(hour) + (minute < 10 ? "0" + minute : String(minute))
+  return formatClock(hour, minute).replace(":", "")
+}
+
+function formatTimesInput(times) {
+  var list = times || []
+  var out = []
+  var i
+  for (i = 0; i < list.length; i++) out.push(formatUserTime(list[i].hour, list[i].minute))
+  return out.join(", ")
+}
+
+function weekdaysFromSpec(raw) {
+  var days = [false, false, false, false, false, false, false]
+  if (!raw || !raw.length) return defaultWeekdays()
+  if (raw.length === 7 && (typeof raw[0] === "boolean" || raw[0] === 0 || raw[0] === 1)) {
+    var copy = []
+    var i
+    for (i = 0; i < 7; i++) copy.push(!!raw[i])
+    return copy
+  }
+  var n
+  for (n = 0; n < raw.length; n++) {
+    var index = parseInt(raw[n], 10)
+    if (index >= 0 && index <= 6) days[index] = true
+  }
+  return days.some(Boolean) ? days : defaultWeekdays()
+}
+
+function parseSchedule(raw) {
+  var spec = defaultScheduleSpec()
+  if (raw === undefined || raw === null || raw === "" || raw === false) return spec
+  if (typeof raw === "string") {
+    var text = raw.trim()
+    if (!text) return spec
+    if (text.charAt(0) === "{") {
+      try { raw = JSON.parse(text) } catch (e) { return spec }
+    } else {
+      spec.enabled = true
+      spec.kind = "daily"
+      var matches = text.match(/(\d{1,2}):(\d{2})(?::\d{2})?/g) || []
+      var clocks = []
+      var i
+      for (i = 0; i < matches.length; i++) {
+        var parsed = parseClockToken(matches[i])
+        if (parsed) clocks.push(parsed)
+      }
+      if (clocks.length) spec.times_text = formatTimesInput(clocks)
+      if (text.indexOf("Mon..Fri") >= 0 || text.indexOf("Mon-Fri") >= 0)
+        spec.weekdays = [false, true, true, true, true, true, false]
+      if (text.indexOf("Mon..Fri") >= 0 || text.indexOf("Mon-Fri") >= 0) spec.kind = "weekly"
+      return spec
+    }
+  }
+  if (typeof raw !== "object") return spec
+  spec.enabled = raw.enabled === true
+  var kind = String(raw.kind || "daily")
+  spec.kind = kind === "interval" || kind === "daily" || kind === "weekly" || kind === "monthly" ? kind : "daily"
+  var minutes = parseInt(raw.minutes, 10)
+  spec.minutes = isFinite(minutes) ? Math.max(1, Math.min(10080, minutes)) : 60
+  var monthday = parseInt(raw.monthday, 10)
+  spec.monthday = isFinite(monthday) ? Math.max(1, Math.min(31, monthday)) : 1
+  spec.weekdays = weekdaysFromSpec(raw.weekdays)
+  if (raw.times_text) spec.times_text = String(raw.times_text)
+  else if (raw.times && raw.times.length) {
+    var times = []
+    var t
+    for (t = 0; t < raw.times.length; t++) {
+      var clock = parseClockToken(raw.times[t])
+      if (clock) times.push(clock)
+    }
+    if (times.length) spec.times_text = formatTimesInput(times)
+  }
+  return spec
+}
+
+function scheduleEnabled(schedule) {
+  return parseSchedule(schedule).enabled === true
+}
+
+function scheduleError(spec) {
+  var parsed = parseSchedule(spec)
+  if (!parsed.enabled) return ""
+  if (parsed.kind === "interval") {
+    if (!parsed.minutes || parsed.minutes < 1) return "Interval must be at least 1 minute"
+    return ""
+  }
+  if (parsed.kind === "daily") {
+    if (!parseTimesText(parsed.times_text).length) return "Add at least one time, like 300 or 1430"
+    return ""
+  }
+  if (parsed.kind === "weekly") {
+    if (!parsed.weekdays.some(Boolean)) return "Choose at least one day of the week"
+    if (!parseTimesText(parsed.times_text).length) return "Add at least one time, like 300 or 1430"
+    return ""
+  }
+  if (parsed.kind === "monthly") {
+    if (parsed.monthday < 1 || parsed.monthday > 31) return "Day of the month must be 1-31"
+    return ""
+  }
+  return "Unknown schedule type"
+}
+
+function scheduleKindLabel(kind) {
+  var options = scheduleKindOptions()
   var i
   for (i = 0; i < options.length; i++) {
-    if (String(options[i].value) === value) return String(options[i].label)
+    if (options[i].value === kind) return options[i].label
   }
-  return value || "Manual only"
+  return "Daily"
+}
+
+function daySuffix(day) {
+  if (day >= 10 && day <= 20) return "th"
+  var ones = day % 10
+  if (ones === 1) return "st"
+  if (ones === 2) return "nd"
+  if (ones === 3) return "rd"
+  return "th"
+}
+
+function scheduleLabel(schedule) {
+  if (schedule && typeof schedule === "object" && schedule.schedule_label)
+    return String(schedule.schedule_label)
+  var parsed = parseSchedule(schedule)
+  if (!parsed.enabled) return "Manual only"
+  var clocks = parseTimesText(parsed.times_text)
+  var clockText = clocks.length ? clocks.map(function(t) { return formatClock(t.hour, t.minute) }).join(", ") : "03:00"
+  if (parsed.kind === "interval")
+    return parsed.minutes === 1 ? "Every 1 minute" : "Every " + parsed.minutes + " minutes"
+  if (parsed.kind === "daily") return "Daily at " + clockText
+  if (parsed.kind === "weekly") {
+    var names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    var chosen = []
+    var i
+    for (i = 0; i < 7; i++) if (parsed.weekdays[i]) chosen.push(names[i])
+    return (chosen.length ? chosen.join(", ") : "no days") + " at " + clockText
+  }
+  var extra = parsed.monthday > 28 ? " (or last day)" : ""
+  return "Monthly on the " + parsed.monthday + daySuffix(parsed.monthday) + extra + " at 03:00"
+}
+
+function scheduleToCli(spec) {
+  var parsed = parseSchedule(spec)
+  if (!parsed.enabled) return ""
+  return JSON.stringify({
+    enabled: true,
+    kind: parsed.kind,
+    minutes: parsed.minutes,
+    times_text: parsed.times_text,
+    weekdays: parsed.weekdays,
+    monthday: parsed.monthday
+  })
 }
 
 function cloudBackends() {
@@ -606,6 +901,28 @@ function rightClickItem(path, sources, excludePaths, home) {
   }
 }
 
+function cycleItem(path, sources, excludePaths, home) {
+  var currentSources = sources || []
+  var currentExcludes = excludePaths || []
+  if (isExactPath(path, currentExcludes, home)) {
+    return {
+      sources: removeMatching(currentSources, path, home, false),
+      excludePaths: removeMatching(currentExcludes, path, home, false)
+    }
+  }
+  if (isExcluded(path, currentExcludes, home)) {
+    return { sources: currentSources.slice(), excludePaths: currentExcludes.slice(), blocked: true }
+  }
+  var state = sourceCheckState(path, currentSources, home)
+  if (state === "on" || state === "inherited" || state === "partial") {
+    return rightClickItem(path, currentSources, currentExcludes, home)
+  }
+  return {
+    sources: addSourcePath(currentSources, path, home),
+    excludePaths: removeMatching(currentExcludes, path, home, false)
+  }
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     parseJson: parseJson,
@@ -631,8 +948,24 @@ if (typeof module !== "undefined") {
     destGlyph: destGlyph,
     entryGlyph: entryGlyph,
     snapshotLabel: snapshotLabel,
-    scheduleOptions: scheduleOptions,
+    snapshotDate: snapshotDate,
+    snapshotDayKey: snapshotDayKey,
+    snapshotDayLabel: snapshotDayLabel,
+    snapshotClock: snapshotClock,
+    snapshotStamp: snapshotStamp,
+    snapshotIdShort: snapshotIdShort,
+    emptyPreview: emptyPreview,
+    pathCrumbs: pathCrumbs,
+    previewKindLabel: previewKindLabel,
+    weekdayLabels: weekdayLabels,
+    defaultWeekdays: defaultWeekdays,
+    defaultScheduleSpec: defaultScheduleSpec,
+    scheduleKindOptions: scheduleKindOptions,
+    parseSchedule: parseSchedule,
+    scheduleEnabled: scheduleEnabled,
+    scheduleError: scheduleError,
     scheduleLabel: scheduleLabel,
+    scheduleToCli: scheduleToCli,
     timeFormatOptions: timeFormatOptions,
     cloudBackends: cloudBackends,
     notifyAgeOptions: notifyAgeOptions,
@@ -650,6 +983,7 @@ if (typeof module !== "undefined") {
     matchingExcludePattern: matchingExcludePattern,
     itemMark: itemMark,
     leftClickItem: leftClickItem,
-    rightClickItem: rightClickItem
+    rightClickItem: rightClickItem,
+    cycleItem: cycleItem
   }
 }
